@@ -1,25 +1,44 @@
-# ===== adzuna_fetch.py – version optimisée =====
-
+# ===== adzuna_fetch.py =====
 import time
-import requests
-import pandas as pd
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from langdetect import detect, LangDetectException
+
+import pandas as pd
+import requests
+from langdetect import LangDetectException, detect
 
 from config import (
-    ADZUNA_APP_ID, ADZUNA_APP_KEY, COUNTRY,
-    SEARCH_TERMS, PRIORITY_TERMS, MAX_DAYS_OLD,
-    ALLOWED_LOCATIONS_KEYWORDS, EXCLUDE_KEYWORDS,
-    ROLE_REQUIRED_KEYWORDS, ROLE_FORBIDDEN_KEYWORDS,
-    ADZUNA_RAW_CSV, ADZUNA_FILTERED_CSV,
+    ADZUNA_APP_ID,
+    ADZUNA_APP_KEY,
+    ADZUNA_FILTERED_CSV,
+    ADZUNA_RAW_CSV,
+    COUNTRY,
+    DEFAULT_PAGES,
+    MAX_DAYS_OLD,
+    MIN_DESCRIPTION_CHARS,
+    PAGES_PER_TERM,
+    REQUIRE_DESCRIPTION,
+    RESULTS_PER_PAGE,
+    SEARCH_TERMS,
+    EXCLUDE_KEYWORDS,
+    ROLE_FORBIDDEN_KEYWORDS,
+    ROLE_REQUIRED_KEYWORDS,
 )
 
 BASE_URL = f"https://api.adzuna.com/v1/api/jobs/{COUNTRY}/search"
 
+# Title patterns to drop immediately
+BAD_TITLE_KEYWORDS = [
+    "senior",
+    "medior",
+    "principal",
+    "expert",
+    " l3 ",
+]
+
 
 def normalize(text: str) -> str:
-    """Enleve les accents et met en minuscules pour comparer proprement."""
+    """Remove accents and lower-case."""
     if not text:
         return ""
     text = unicodedata.normalize("NFD", text)
@@ -27,8 +46,8 @@ def normalize(text: str) -> str:
     return text.lower()
 
 
-def fetch_adzuna_page(page: int = 1, term: str = "devops", results_per_page: int = 50):
-    """Appelle l'API Adzuna pour un terme et une page donnés."""
+def fetch_adzuna_page(page: int, term: str, results_per_page: int = RESULTS_PER_PAGE):
+    """Call Adzuna API for a given term and page."""
     url = f"{BASE_URL}/{page}"
     params = {
         "app_id": ADZUNA_APP_ID,
@@ -48,9 +67,9 @@ def fetch_adzuna_page(page: int = 1, term: str = "devops", results_per_page: int
 
 
 def is_recent(date_str, max_days: int) -> bool:
-    """Retourne True si l'offre est plus recente que max_days (en UTC)."""
+    """Return True if offer is newer than max_days (UTC)."""
     try:
-        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
         dt = dt.astimezone(timezone.utc)
     except Exception:
         return False
@@ -60,27 +79,26 @@ def is_recent(date_str, max_days: int) -> bool:
 
 
 def location_ok(loc: str) -> bool:
-    """Pour l'instant on accepte toutes les localisations (filtrage par langue et seniorite)."""
+    """Currently allow all locations."""
     return True
-    # Si plus tard tu veux filtrer:
+    # If later you want to filter:
     # norm_loc = normalize(loc)
     # return any(normalize(k) in norm_loc for k in ALLOWED_LOCATIONS_KEYWORDS)
 
 
 def no_excluded_keywords(text: str) -> bool:
-    """Retourne False si un des mots-cles exclus apparait dans le texte."""
+    """Return False if any excluded keyword appears."""
     norm = normalize(text)
     return not any(normalize(kw) in norm for kw in EXCLUDE_KEYWORDS)
 
 
 def is_dutch(text: str) -> bool:
-    """Retourne True si la langue detectee est le neerlandais (ou gros indice NL)."""
+    """Return True if language looks Dutch."""
     try:
         snippet = (text or "")[:800]
         if not snippet.strip():
             return False
 
-        # petit heuristique avant langdetect
         norm = normalize(snippet)
         if " nederlands " in f" {norm} " or " dutch " in f" {norm} ":
             return True
@@ -94,36 +112,21 @@ def is_dutch(text: str) -> bool:
 
 
 def role_relevant(title: str, desc: str) -> bool:
-    """
-    Filtre sur le type de role :
-    - exclut les jobs non-tech / data / ML / dev pur / automation industrielle
-    - garde seulement les roles infra / cloud / devops / security / telecom pertinents
-    """
+    """Keep infra / cloud / devops roles, drop forbidden ones."""
     text = normalize((title or "") + " " + (desc or ""))
 
-    # 1) Exclure immediatement si le role contient un mot "forbidden"
     for bad in ROLE_FORBIDDEN_KEYWORDS:
         if bad in text:
             return False
 
-    # 2) Garder seulement si au moins un mot-cle "required" est present
     return any(good in text for good in ROLE_REQUIRED_KEYWORDS)
 
 
-
-
 def compute_junior_score(title: str, desc: str) -> int:
-    """
-    Score "junior-friendliness" de l'annonce.
-    > 0 : plutot adapte junior
-    0 : neutre
-    < 0 : tendance senior
-    """
+    """Score junior-friendliness."""
     text = normalize((title or "") + " " + (desc or ""))
-
     score = 0
 
-    # Signaux positifs (plutot junior)
     positive_patterns = [
         "junior",
         "young graduate",
@@ -143,12 +146,10 @@ def compute_junior_score(title: str, desc: str) -> int:
         "new graduate",
         "young talent",
     ]
-
     for pat in positive_patterns:
         if pat in text:
             score += 2
 
-    # Signaux negatifs (tendance senior)
     negative_patterns = [
         "strong experience",
         "solid experience",
@@ -162,13 +163,11 @@ def compute_junior_score(title: str, desc: str) -> int:
         "broad experience",
         "many years of experience",
         "extensive experience",
-
         "5 years",
         "5+ years",
         "4 years",
         "4+ years",
         "3+ years",
-
         "cloud architect",
         "devops architect",
         "senior devops",
@@ -177,7 +176,6 @@ def compute_junior_score(title: str, desc: str) -> int:
         "team lead",
         "technical lead",
         "tech lead",
-
         "ability to mentor",
         "mentor junior",
         "coaching",
@@ -193,7 +191,6 @@ def compute_junior_score(title: str, desc: str) -> int:
         "design cloud solutions",
         "make architectural decisions",
     ]
-
     for pat in negative_patterns:
         if pat in text:
             score -= 2
@@ -202,15 +199,78 @@ def compute_junior_score(title: str, desc: str) -> int:
 
 
 def safe_save_csv(df, path, retry_delay=3):
-    """Sauvegarde un CSV, reessaie si le fichier est verrouille (Excel ouvert)."""
+    """Save CSV and retry if locked by Excel."""
     while True:
         try:
             df.to_csv(path, index=False)
             print(f"[INFO] Saved file: {path}")
             break
         except PermissionError:
-            print(f"[WARN] Le fichier {path} est ouvert. Ferme Excel et appuie sur Entree...")
+            print(f"[WARN] File {path} is open. Close it and press Enter...")
             input()
+
+
+def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
+    """Apply common filters and return normalized job if it passes."""
+    created = job.get("created", "") or job.get("updated", "")
+
+    loc = job.get("location", "")
+    if isinstance(loc, dict):
+        loc = loc.get("display_name", "")
+    if not loc:
+        loc = job.get("location.display_name", "")
+
+    title = job.get("title", "") or ""
+    desc = job.get("description", "") or ""
+    url = job.get("redirect_url", "") or job.get("url", "") or job.get("link", "")
+
+    company_val = job.get("company", "")
+    if isinstance(company_val, dict):
+        company = company_val.get("display_name", "") or company_val.get("name", "")
+    else:
+        company = company_val or job.get("company.display_name", "")
+
+    if REQUIRE_DESCRIPTION and len(desc.strip()) < MIN_DESCRIPTION_CHARS:
+        return None
+
+    norm_title = normalize(title)
+    if any(bt in norm_title for bt in BAD_TITLE_KEYWORDS):
+        return None
+
+    full_text = f"{title} {desc}"
+
+    if not is_recent(created, MAX_DAYS_OLD):
+        return None
+
+    if not location_ok(loc):
+        return None
+
+    if not role_relevant(title, desc):
+        return None
+
+    if not no_excluded_keywords(full_text):
+        return None
+
+    if is_dutch(full_text):
+        return None
+
+    junior_score = compute_junior_score(title, desc)
+    if junior_score <= 0:
+        return None
+
+    return {
+        "title": title,
+        "company": company,
+        "location": loc,
+        "created": created,
+        "url": url,
+        "salary_min": job.get("salary_min"),
+        "salary_max": job.get("salary_max"),
+        "description": desc[:400],
+        "search_term": job.get("search_term", ""),
+        "junior_score": junior_score,
+        "source": source,
+    }
 
 
 def main():
@@ -227,28 +287,20 @@ def main():
 
     all_jobs = []
 
-    # ============================
-    # MODE 1 : PAS DE FETCH (juste filtrer le fichier brut)
-    # ============================
     if args.no_fetch:
         if not os.path.exists(ADZUNA_RAW_CSV):
             print(f"[ERROR] Fichier brut introuvable: {ADZUNA_RAW_CSV}")
             return
-
         print("[INFO] Chargement du fichier brut existant...")
         df_raw = pd.read_csv(ADZUNA_RAW_CSV)
         all_jobs = df_raw.to_dict(orient="records")
-
-    # ============================
-    # MODE 2 : FETCH + RAW
-    # ============================
     else:
         for term in SEARCH_TERMS:
             print(f"[INFO] Searching for: {term}")
-            page_count = PRIORITY_TERMS.get(term, 2)  # 2 pages par défaut
+            page_count = PAGES_PER_TERM.get(term, DEFAULT_PAGES)
 
             for page in range(1, page_count + 1):
-                data = fetch_adzuna_page(page, term)
+                data = fetch_adzuna_page(page, term, RESULTS_PER_PAGE)
                 if not data:
                     continue
 
@@ -266,64 +318,13 @@ def main():
         safe_save_csv(df_raw, ADZUNA_RAW_CSV)
         print(f"[INFO] Raw saved: {len(df_raw)}")
 
-    # ============================
-    # FILTRAGE (avec gestion des doublons)
-    # ============================
+    # Filtering
     filtered = []
-
     for job in all_jobs:
-        created = job.get("created", "")
-        loc = job.get("location", {}).get("display_name", "")
-        title = job.get("title", "")
-        desc = job.get("description", "") or ""
-        url = job.get("redirect_url", "")
-        
-        bad_titles = [
-        "senior",
-        "medior",
-        "principal",
-        "expert",
-        " l3 ",
-        ]
-        if any(bt in normalize(title) for bt in bad_titles):
-            continue
+        parsed = passes_filters(job, source="adzuna")
+        if parsed:
+            filtered.append(parsed)
 
-        full_text = f"{title} {desc}"
-
-        if not is_recent(created, MAX_DAYS_OLD):
-            continue
-
-        if not location_ok(loc):
-            continue
-
-        if not role_relevant(title, desc):
-            continue
-
-        if not no_excluded_keywords(full_text):
-            continue
-
-        if is_dutch(full_text):
-            continue
-
-        junior_score = compute_junior_score(title, desc)
-        if junior_score <= 0:
-            continue
-
-        filtered.append({
-            "title": title,
-            "company": job.get("company", {}).get("display_name", ""),
-            "location": loc,
-            "created": created,
-            "url": url,
-            "salary_min": job.get("salary_min"),
-            "salary_max": job.get("salary_max"),
-            "description": desc[:400],
-            "search_term": job.get("search_term", ""),
-            "junior_score": junior_score,
-            "source": "adzuna",
-        })
-
-    # DataFrame + suppression des doublons (meme url / titre / company)
     df_f = pd.DataFrame(filtered)
     before = len(df_f)
     df_f = df_f.drop_duplicates(subset=["url", "title", "company"])
@@ -332,7 +333,6 @@ def main():
 
     safe_save_csv(df_f, ADZUNA_FILTERED_CSV)
     print(f"[INFO] Filtered saved: {len(df_f)}")
-
 
 
 if __name__ == "__main__":

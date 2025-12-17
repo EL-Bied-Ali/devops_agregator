@@ -3,6 +3,19 @@ ADZUNA_APP_KEY = "883990e03a21c61e376492c7e2ccf2ed"
 
 JOOBLE_API_KEY = "TON_API_KEY_JOOBLE"
 
+# Pagination et taille de page
+# PAGES_PER_TERM : dict facultatif pour surcharger le nombre de pages par terme
+PAGES_PER_TERM = {
+    # "devops": 3,
+    # "cloud": 2,
+}
+DEFAULT_PAGES = 2
+RESULTS_PER_PAGE = 50
+
+# Description minimale
+REQUIRE_DESCRIPTION = True
+MIN_DESCRIPTION_CHARS = 120
+
 COUNTRY = "be"
 
 # Termes de recherche pour récupérer large côté API
@@ -406,4 +419,8 @@ ROLE_FORBIDDEN_KEYWORDS = [
 
 ADZUNA_RAW_CSV = "data/adzuna_jobs_raw.csv"
 ADZUNA_FILTERED_CSV = "data/adzuna_jobs_filtered.csv"
+JOOBLE_RAW_CSV = "data/jooble_jobs_raw.csv"
+JOOBLE_FILTERED_CSV = "data/jooble_jobs_filtered.csv"
 MERGED_CSV = "data/all_jobs_merged.csv"
+MERGED_RAW_CSV = "data/all_jobs_merged_raw.csv"
+MERGED_FILTERED_CSV = "data/all_jobs_merged_filtered.csv"

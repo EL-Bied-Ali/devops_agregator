@@ -86,6 +86,9 @@ def location_ok(loc: str) -> bool:
     norm_loc = normalize(loc)
     if not norm_loc:
         return False
+    # Accept any location containing "belg" (Belgium/Belgique) or remote hints
+    if "belg" in norm_loc or " remote" in norm_loc or "teletravail" in norm_loc or "telework" in norm_loc:
+        return True
     return any(normalize(k) in norm_loc for k in ALLOWED_LOCATIONS_KEYWORDS)
 
 
@@ -153,7 +156,8 @@ def compute_junior_score(title: str, desc: str) -> int:
         if pat in text:
             score += 2
 
-    negative_patterns = [
+    # Heavier senior signals
+    severe_negative = [
         "strong experience",
         "solid experience",
         "proven experience",
@@ -166,11 +170,6 @@ def compute_junior_score(title: str, desc: str) -> int:
         "broad experience",
         "many years of experience",
         "extensive experience",
-        "5 years",
-        "5+ years",
-        "4 years",
-        "4+ years",
-        "3+ years",
         "cloud architect",
         "devops architect",
         "senior devops",
@@ -179,6 +178,21 @@ def compute_junior_score(title: str, desc: str) -> int:
         "team lead",
         "technical lead",
         "tech lead",
+        "make architectural decisions",
+        "design scalable systems",
+        "design cloud solutions",
+    ]
+    for pat in severe_negative:
+        if pat in text:
+            score -= 2
+
+    # Mild senior signals
+    mild_negative = [
+        "5 years",
+        "5+ years",
+        "4 years",
+        "4+ years",
+        "3+ years",
         "ability to mentor",
         "mentor junior",
         "coaching",
@@ -190,13 +204,10 @@ def compute_junior_score(title: str, desc: str) -> int:
         "end-to-end responsibility",
         "strategic",
         "strategic mindset",
-        "design scalable systems",
-        "design cloud solutions",
-        "make architectural decisions",
     ]
-    for pat in negative_patterns:
+    for pat in mild_negative:
         if pat in text:
-            score -= 2
+            score -= 1
 
     return score
 
@@ -259,7 +270,8 @@ def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
 
     # Autoriser les offres neutres (score >= 0) pour ne pas filtrer trop agressivement
     junior_score = compute_junior_score(title, desc)
-    if junior_score < 0:
+    # Autoriser les annonces neutres et légèrement seniorisées, filtrer seulement les scores très négatifs
+    if junior_score < -1:
         return None
 
     return {

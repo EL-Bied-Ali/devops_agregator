@@ -8,8 +8,21 @@ JOOBLE_LOCATION = ""
 # Pagination et taille de page
 # PAGES_PER_TERM : dict facultatif pour surcharger le nombre de pages par terme
 PAGES_PER_TERM = {
-    # "devops": 3,
-    # "cloud": 2,
+    "devops": 4,
+    "devops engineer": 4,
+    "cloud support": 4,
+    "cloud support engineer": 4,
+    "cloud engineer": 3,
+    "junior cloud engineer": 3,
+    "system administrator": 3,
+    "linux system administrator": 3,
+    "platform engineer": 3,
+    "site reliability engineer": 3,
+    "sre": 3,
+    "operations engineer": 3,
+    "it operations": 3,
+    "kubernetes": 2,
+    "docker": 2,
 }
 DEFAULT_PAGES = 2
 RESULTS_PER_PAGE = 50
@@ -20,31 +33,32 @@ MIN_DESCRIPTION_CHARS = 60
 
 COUNTRY = "be"
 
-# Termes de recherche pour récupérer large côté API
-# --> orientés Cloud / SysAdmin / DevOps junior-friendly
+# Termes de recherche pour recuperer large cote API
+# --> orientes Cloud / SysAdmin / DevOps junior-friendly
 SEARCH_TERMS = [
-    # cœur DevOps / Cloud
+    # coeur DevOps / Cloud
     "devops",
     "devops engineer",
     "junior devops",
-    "cloud",
+    "system administrator",
+    "linux system administrator",
+    "linux system engineer",
+    "systems administrator",
+    "systems engineer",
+    "sysadmin",
+    "it operations",
+    "operations engineer",
+    "platform engineer",
     "cloud engineer",
     "junior cloud engineer",
     "cloud operations",
     "cloud operations engineer",
     "cloud support",
     "cloud support engineer",
-    "platform engineer",
+    "cloud support specialist",
     "site reliability engineer",
     "sre",
-    "linux engineer",
-    "linux system engineer",
-    "linux system administrator",
-    "system administrator",
-    "systems administrator",
-    "systems engineer",
     "infrastructure engineer",
-    "infrastructure specialist",
     "build engineer",
     "release engineer",
 
@@ -58,11 +72,13 @@ SEARCH_TERMS = [
     "automation engineer",
     "kubernetes",
     "docker",
+    "monitoring engineer",
+    "observability",
 ]
 
-# pondération des termes pour le scoring
+# ponderation des termes pour le scoring
 PRIORITY_TERMS = {
-    "cloud support": 6,             # priorité max pour toi
+    "cloud support": 6,             # priorite max pour toi
     "cloud operations": 6,
     "cloud engineer": 5,
     "junior cloud engineer": 5,
@@ -77,16 +93,24 @@ PRIORITY_TERMS = {
 # annonces pas plus vieilles que 45 jours (moins strict pour garder plus d'offres)
 MAX_DAYS_OLD = 45
 
-# on élargit à toute la Belgique, mais filtrée par grandes villes
+# on elargit a toute la Belgique, mais filtree par grandes villes
 ALLOWED_LOCATIONS_KEYWORDS = [
     "Brussels",
     "Bruxelles",
     "Belgium",
     "Belgique",
+    "Flanders",
+    "Vlaanderen",
+    "Flemish",
     "Wallonia",
     "Wallonie",
+    "Flemish Brabant",
+    "Brabant Flamand",
+    "Brabant Wallon",
+    "Walloon Brabant",
+    "Hainaut",
     "Liege",
-    "Liège",
+    "Liege Province",
     "Charleroi",
     "Namur",
     "Mons",
@@ -97,14 +121,23 @@ ALLOWED_LOCATIONS_KEYWORDS = [
     "Anvers",
     "Ghent",
     "Gent",
+    "East Flanders",
+    "West Flanders",
     "Mechelen",
     "Malines",
     "Kortrijk",
+    "Limbourg",
+    "Limburg",
+    "Arlon",
+    "Luxembourg",
+    "Remote",
+    "Teletravail",
+    "Telework",
 ]
 
 # on filtre ce qu'on ne veut PAS:
 # - postes trop seniors
-# - jobs où le néerlandais est clairement exigé
+# - jobs ou le neerlandais est clairement exige
 EXCLUDE_KEYWORDS = [
     # seniority
     "senior",
@@ -145,24 +178,24 @@ EXCLUDE_KEYWORDS = [
     "8+ years",
     "10+ years",
 
-    # FR - années d'expérience
+    # FR - annees d'experience
     "au moins 3 ans",
     "au moins 4 ans",
     "au moins 5 ans",
     "min. 3 ans",
     "min. 4 ans",
     "min. 5 ans",
-    "minimum 3 ans d'expérience",
-    "minimum 4 ans d'expérience",
-    "minimum 5 ans d'expérience",
-    "plusieurs années d'expérience",
+    "minimum 3 ans d'experience",
+    "minimum 4 ans d'experience",
+    "minimum 5 ans d'experience",
+    "plusieurs annees d'experience",
 
-    # FR - profils confirmés / seniors
-    "expérience confirmée",
-    "expérience significative",
-    "expérience solide",
-    "expérience approfondie",
-    "profil confirmé",
+    # FR - profils confirmes / seniors
+    "experience confirmee",
+    "experience significative",
+    "experience solide",
+    "experience approfondie",
+    "profil confirme",
     "profil senior",
 
     # contracting & consulting senior roles
@@ -171,7 +204,7 @@ EXCLUDE_KEYWORDS = [
     "consultant senior",
     "consulting lead",
 
-    # red flags de séniorité / ownership
+    # red flags de seniorite / ownership
     "ownership",
     "take ownership",
     "autonomous",
@@ -191,13 +224,13 @@ EXCLUDE_KEYWORDS = [
 
     # signaux de postes infra seniors / data center
     "experience in data center",
-    "expérience en data center",
-    "data center européen",
+    "experience en data center",
+    "data center europeen",
     "migration des infrastructures",
     "migrate infrastructure",
     "strong experience",
     "solide experience",
-    "3 à 5 ans",
+    "3 a 5 ans",
     "3-5 years",
     "5 ans",
     "5 years",
@@ -217,9 +250,9 @@ EXCLUDE_KEYWORDS = [
     "nederlands vereist",
     "nederlands verplicht",
     "moedertaal nederlands",
-    "zeer goede connaissance du néerlandais",
     "zeer goede connaissance du neerlandais",
-    "zeer goede kennis nederlands",
+    "zeer goede connaissance du neerlandais",
+    "zeer goede connaissance du neerlandais",
     "goede kennis nederlands",
     "perfect nederlands",
 
@@ -243,7 +276,7 @@ EXCLUDE_KEYWORDS = [
     "artificial intelligence",
     "python engineer",
 
-    # hors scope embarqué / vidéo / test logiciel pur
+    # hors scope embarque / video / test logiciel pur
     "embedded",
     "embedded software",
     "firmware",
@@ -253,11 +286,11 @@ EXCLUDE_KEYWORDS = [
     "rail traffic data",
 ]
 
-# ==== filtres de type de rôle (optimisés pour ton profil) ====
+# ==== filtres de type de role (optimises pour ton profil) ====
 
-# Rôles qu'on considère pertinents pour toi après DevOps + AZ-400 + Master ULB
+# Roles qu'on considere pertinents pour toi apres DevOps + AZ-400 + Master ULB
 ROLE_REQUIRED_KEYWORDS = [
-    # cœur Cloud / Infra / DevOps
+    # coeur Cloud / Infra / DevOps
     "devops",
     "devops engineer",
     "cloud engineer",
@@ -270,7 +303,7 @@ ROLE_REQUIRED_KEYWORDS = [
     "site reliability engineer",
     "sre",
 
-    # Linux / systèmes
+    # Linux / systemes
     "linux system administrator",
     "linux administrator",
     "linux admin",
@@ -282,7 +315,7 @@ ROLE_REQUIRED_KEYWORDS = [
     "infrastructure engineer",
     "infra engineer",
 
-    # Observabilité / pipelines / automation
+    # Observabilite / pipelines / automation
     "observability",
     "monitoring engineer",
     "monitoring specialist",
@@ -294,35 +327,34 @@ ROLE_REQUIRED_KEYWORDS = [
     "pipeline engineer",
     "reliability engineer",
 
-    # DevSecOps / sécurité liée à l’infra (facultatif mais OK)
+    # DevSecOps / securite liee a l'infra (facultatif mais OK)
     "devsecops",
     "security operations",
 ]
 
-# Rôles à exclure : non-tech, commerciaux, data/ML/AI, dev pur, automation industrielle
+# Roles a exclure : non-tech, commerciaux, data/ML/AI, dev pur, automation industrielle
 ROLE_FORBIDDEN_KEYWORDS = [
-
     "sql database administrator",
     "database administrator",
     " dba ",
     "keycloak",
     "observability engineer",
     "ict observability engineer",
-    
+
     # hors scope management / C-level
     "coo",
     "chief operating officer",
 
-    # qualité/systèmes non infra
+    # qualite/systemes non infra
     "quality & systems",
-    "ingénieur qualité",
+    "ingenieur qualite",
 
-    # sécurité très pointue
+    # securite tres pointue
     "cyber security specialist",
     "mergers & acquisitions",
     "m&a",
 
-    # L3 / niveaux élevés
+    # L3 / niveaux eleves
     " l3 ",
 
     # non-tech / sales
@@ -358,7 +390,7 @@ ROLE_FORBIDDEN_KEYWORDS = [
     "sea ",
     "sem ",
 
-    # rôles support / coord / qualité (non tech)
+    # roles support / coord / qualite (non tech)
     "quality coordinator",
     "quality officer",
     "project coordinator",
@@ -380,7 +412,7 @@ ROLE_FORBIDDEN_KEYWORDS = [
     "consultant data",
     "data engineer",
 
-    # développement pur (pas DevOps/System)
+    # developpement pur (pas DevOps/System)
     "frontend developer",
     "front end developer",
     "front-end developer",

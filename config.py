@@ -1,8 +1,9 @@
 ADZUNA_APP_ID = "026d8627"
 ADZUNA_APP_KEY = "883990e03a21c61e376492c7e2ccf2ed"
 
-JOOBLE_API_KEY = "8c2517d4-85cf-4b1e-9729-6823aef99b1c"
-JOOBLE_LOCATION = "Belgium"
+JOOBLE_API_KEY = "0120a851-1f04-402d-bd97-3c3ba48a4ac8"
+# Laisser vide pour ne pas restreindre l'API Jooble (filtrage fait ensuite)
+JOOBLE_LOCATION = ""
 
 # Pagination et taille de page
 # PAGES_PER_TERM : dict facultatif pour surcharger le nombre de pages par terme
@@ -13,9 +14,9 @@ PAGES_PER_TERM = {
 DEFAULT_PAGES = 2
 RESULTS_PER_PAGE = 50
 
-# Description minimale
+# Description minimale (plus souple pour garder les offres courtes)
 REQUIRE_DESCRIPTION = True
-MIN_DESCRIPTION_CHARS = 120
+MIN_DESCRIPTION_CHARS = 60
 
 COUNTRY = "be"
 
@@ -73,8 +74,8 @@ PRIORITY_TERMS = {
     "platform engineer": 3,
 }
 
-# annonces pas plus vieilles que 15 jours
-MAX_DAYS_OLD = 15
+# annonces pas plus vieilles que 45 jours (moins strict pour garder plus d'offres)
+MAX_DAYS_OLD = 45
 
 # on élargit à toute la Belgique, mais filtrée par grandes villes
 ALLOWED_LOCATIONS_KEYWORDS = [

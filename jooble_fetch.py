@@ -25,12 +25,13 @@ BASE_URL = f"https://jooble.org/api/{JOOBLE_API_KEY}"
 def fetch_jooble_page(term: str, page: int, results_per_page: int = RESULTS_PER_PAGE):
     payload = {
         "keywords": term,
-        "location": JOOBLE_LOCATION,
         "page": page,
         "searchParam": {
             "pageSize": results_per_page,
         },
     }
+    if JOOBLE_LOCATION:
+        payload["location"] = JOOBLE_LOCATION
     try:
         resp = requests.post(BASE_URL, json=payload, timeout=12)
         resp.raise_for_status()

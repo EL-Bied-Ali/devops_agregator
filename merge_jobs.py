@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import pandas as pd
+from pandas.errors import EmptyDataError
 from rapidfuzz import fuzz
 
 from adzuna_fetch import passes_filters, safe_save_csv
@@ -165,6 +166,9 @@ def load_raw_jobs(path: str, source: str) -> List[Dict]:
         df = pd.read_csv(path)
     except FileNotFoundError:
         print(f"[MERGE] No file for {source}: {path}")
+        return []
+    except EmptyDataError:
+        print(f"[MERGE] Empty file for {source}: {path}")
         return []
     records = df.to_dict(orient="records")
     print(f"[MERGE] Loaded {len(records)} rows from {source}")

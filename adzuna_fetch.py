@@ -15,6 +15,7 @@ from config import (
     COUNTRY,
     DEFAULT_PAGES,
     MAX_DAYS_OLD,
+    ALLOWED_LOCATIONS_KEYWORDS,
     MIN_DESCRIPTION_CHARS,
     PAGES_PER_TERM,
     REQUIRE_DESCRIPTION,
@@ -256,8 +257,9 @@ def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
     if is_dutch(full_text):
         return None
 
+    # Autoriser les offres neutres (score >= 0) pour ne pas filtrer trop agressivement
     junior_score = compute_junior_score(title, desc)
-    if junior_score <= 0:
+    if junior_score < 0:
         return None
 
     return {

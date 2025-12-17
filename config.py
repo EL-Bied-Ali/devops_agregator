@@ -242,9 +242,12 @@ EXCLUDE_KEYWORDS = [
     # clearances / consulting exigeant
     "security clearance",
     "clearance",
+    "secret clearance",
+    "top secret",
     "nato",
     "cosmic",
-    "consultant ",
+    "consultant",
+    "contractor",
 
     # language - dutch
     "dutch required",

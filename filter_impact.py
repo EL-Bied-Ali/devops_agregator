@@ -99,8 +99,8 @@ def check_dutch(text: str) -> Tuple[bool, str]:
 
 def check_junior(title: str, desc: str) -> Tuple[bool, str, int]:
     score = compute_junior_score(title, desc)
-    # Match the same threshold as passes_filters (allow mild negatives)
-    return score >= -1, "" if score >= -1 else "junior_score<-1", score
+    # Match the same threshold as passes_filters (score >= 0)
+    return score >= 0, "" if score >= 0 else "junior_score<0", score
 
 
 def summarize_counter(counter: Counter, top_n: int = 5, show_all: bool = False) -> str:

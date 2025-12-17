@@ -141,6 +141,14 @@ def compute_junior_score(title: str, desc: str) -> int:
         "entry level",
         "trainee",
         "training program",
+        "traineeship",
+        "apprentice",
+        "apprenticeship",
+        "alternance",
+        "intern",
+        "internship",
+        "stage",
+        "stagiaire",
         "0-2 years",
         "0-3 years",
         "1-2 years experience",
@@ -204,6 +212,8 @@ def compute_junior_score(title: str, desc: str) -> int:
         "end-to-end responsibility",
         "strategic",
         "strategic mindset",
+        "contractor",
+        "consultant",
     ]
     for pat in mild_negative:
         if pat in text:
@@ -277,8 +287,8 @@ def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
 
     # Autoriser les offres neutres (score >= 0) pour ne pas filtrer trop agressivement
     junior_score = compute_junior_score(title, desc)
-    # Autoriser les annonces neutres et légèrement seniorisées, filtrer seulement les scores très négatifs
-    if junior_score < -1:
+    # Exclure les annonces au score clairement négatif, garder neutre ou positif
+    if junior_score < 0:
         return None
 
     return {

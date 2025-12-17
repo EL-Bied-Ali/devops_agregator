@@ -24,6 +24,7 @@ def normalize_simple(text: str) -> str:
     """Lowercase, strip accents, remove punctuation and collapse spaces."""
     if not text:
         return ""
+    text = str(text)
     text = unicodedata.normalize("NFD", text)
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
     text = re.sub(r"[^a-z0-9\s]", " ", text.lower())
@@ -35,7 +36,7 @@ def strip_tokens(text: str) -> str:
     """Remove common tokens that create false duplicates."""
     if not text:
         return ""
-    cleaned = text.lower()
+    cleaned = str(text).lower()
     cleaned = re.sub(r"\(m[fwhx]/?f?/?x?\)", " ", cleaned)
     for tok in ["m/f/x", "m/f", "m w d", "junior", "senior", "medior"]:
         cleaned = cleaned.replace(tok, " ")

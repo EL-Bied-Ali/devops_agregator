@@ -79,11 +79,13 @@ def is_recent(date_str, max_days: int) -> bool:
 
 
 def location_ok(loc: str) -> bool:
-    """Currently allow all locations."""
-    return True
-    # If later you want to filter:
-    # norm_loc = normalize(loc)
-    # return any(normalize(k) in norm_loc for k in ALLOWED_LOCATIONS_KEYWORDS)
+    """Allow only locations that match allowed keywords (if configured)."""
+    if not ALLOWED_LOCATIONS_KEYWORDS:
+        return True
+    norm_loc = normalize(loc)
+    if not norm_loc:
+        return False
+    return any(normalize(k) in norm_loc for k in ALLOWED_LOCATIONS_KEYWORDS)
 
 
 def no_excluded_keywords(text: str) -> bool:

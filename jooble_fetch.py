@@ -11,6 +11,7 @@ from adzuna_fetch import passes_filters, safe_save_csv
 from config import (
     DEFAULT_PAGES,
     JOOBLE_API_KEY,
+    JOOBLE_LOCATION,
     JOOBLE_FILTERED_CSV,
     JOOBLE_RAW_CSV,
     RESULTS_PER_PAGE,
@@ -24,6 +25,7 @@ BASE_URL = f"https://jooble.org/api/{JOOBLE_API_KEY}"
 def fetch_jooble_page(term: str, page: int, results_per_page: int = RESULTS_PER_PAGE):
     payload = {
         "keywords": term,
+        "location": JOOBLE_LOCATION,
         "page": page,
         "searchParam": {
             "pageSize": results_per_page,

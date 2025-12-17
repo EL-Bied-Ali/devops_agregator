@@ -2,6 +2,7 @@ ADZUNA_APP_ID = "026d8627"
 ADZUNA_APP_KEY = "883990e03a21c61e376492c7e2ccf2ed"
 
 JOOBLE_API_KEY = "8c2517d4-85cf-4b1e-9729-6823aef99b1c"
+JOOBLE_LOCATION = "Belgium"
 
 # Pagination et taille de page
 # PAGES_PER_TERM : dict facultatif pour surcharger le nombre de pages par terme
@@ -79,6 +80,8 @@ MAX_DAYS_OLD = 15
 ALLOWED_LOCATIONS_KEYWORDS = [
     "Brussels",
     "Bruxelles",
+    "Belgium",
+    "Belgique",
     "Wallonia",
     "Wallonie",
     "Liege",

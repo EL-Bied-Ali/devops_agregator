@@ -80,16 +80,8 @@ def is_recent(date_str, max_days: int) -> bool:
 
 
 def location_ok(loc: str) -> bool:
-    """Allow only locations that match allowed keywords (if configured)."""
-    if not ALLOWED_LOCATIONS_KEYWORDS:
-        return True
-    norm_loc = normalize(loc)
-    if not norm_loc:
-        return False
-    # Accept any location containing "belg" (Belgium/Belgique) or remote hints
-    if "belg" in norm_loc or " remote" in norm_loc or "teletravail" in norm_loc or "telework" in norm_loc:
-        return True
-    return any(normalize(k) in norm_loc for k in ALLOWED_LOCATIONS_KEYWORDS)
+    """Accept all locations; Dutch filter will remove NL-only ads."""
+    return True
 
 
 def no_excluded_keywords(text: str) -> bool:

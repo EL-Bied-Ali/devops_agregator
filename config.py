@@ -239,6 +239,13 @@ EXCLUDE_KEYWORDS = [
     "deep knowledge",
     "broad experience",
 
+    # clearances / consulting exigeant
+    "security clearance",
+    "clearance",
+    "nato",
+    "cosmic",
+    "consultant ",
+
     # language - dutch
     "dutch required",
     "dutch mandatory",

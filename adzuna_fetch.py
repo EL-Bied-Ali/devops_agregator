@@ -212,16 +212,22 @@ def compute_junior_score(title: str, desc: str) -> int:
     return score
 
 
-def safe_save_csv(df, path, retry_delay=3):
-    """Save CSV and retry if locked by Excel."""
-    while True:
+def safe_save_csv(df, path, retry_delay=3, max_retries=3):
+    """Save CSV and retry if locked by Excel; fall back to .bak if still locked."""
+    attempts = 0
+    while attempts < max_retries:
         try:
             df.to_csv(path, index=False)
             print(f"[INFO] Saved file: {path}")
-            break
+            return
         except PermissionError:
-            print(f"[WARN] File {path} is open. Close it and press Enter...")
-            input()
+            attempts += 1
+            print(f"[WARN] File {path} is open (attempt {attempts}/{max_retries}). Retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
+    # fallback
+    backup = path + ".bak"
+    df.to_csv(backup, index=False)
+    print(f"[WARN] Could not write {path} after {max_retries} attempts. Saved to {backup} instead.")
 
 
 def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
@@ -237,6 +243,7 @@ def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
     title = job.get("title", "") or ""
     desc = job.get("description", "") or ""
     url = job.get("redirect_url", "") or job.get("url", "") or job.get("link", "")
+    canonical_url = url.split("?", 1)[0] if url else ""
 
     company_val = job.get("company", "")
     if isinstance(company_val, dict):
@@ -280,6 +287,7 @@ def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
         "location": loc,
         "created": created,
         "url": url,
+        "canonical_url": canonical_url,
         "salary_min": job.get("salary_min"),
         "salary_max": job.get("salary_max"),
         "description": desc[:400],
@@ -343,7 +351,9 @@ def main():
 
     df_f = pd.DataFrame(filtered)
     before = len(df_f)
-    df_f = df_f.drop_duplicates(subset=["url", "title", "company"])
+    if "canonical_url" not in df_f.columns:
+        df_f["canonical_url"] = df_f["url"].str.split("?", n=1).str[0]
+    df_f = df_f.drop_duplicates(subset=["canonical_url", "title", "company"])
     after = len(df_f)
     print(f"[INFO] Duplicates removed: {before - after}")
 

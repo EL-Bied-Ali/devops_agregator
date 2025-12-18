@@ -70,6 +70,14 @@ SEARCH_TERMS = [
     "cicd",
     "ci/cd",
     "automation engineer",
+    "automation & mechanical",
+    "ot ",
+    "operational technology",
+    "waterwastewater",
+    "water wastewater",
+    "wastewater",
+    "formula one",
+    "f1 ",
     "kubernetes",
     "docker",
     "monitoring engineer",
@@ -246,7 +254,12 @@ EXCLUDE_KEYWORDS = [
     "top secret",
     "nato",
     "cosmic",
+    "defense",
+    "defence",
+    "military",
+    "classified",
     "consultant",
+    "consulting",
     "contractor",
 
     # language - dutch
@@ -440,6 +453,7 @@ ROLE_FORBIDDEN_KEYWORDS = [
     "web developer",
     "software engineer",
     "software developer",
+    "content moderator",
 
     # QA fonctionnel, testeur non infra
     "manual tester",

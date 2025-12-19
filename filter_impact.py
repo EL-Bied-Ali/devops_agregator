@@ -16,11 +16,11 @@ from adzuna_fetch import (
     ROLE_FORBIDDEN_KEYWORDS,
     ROLE_REQUIRED_KEYWORDS,
     EXCLUDE_KEYWORDS,
+    excluded_hits,
     normalize,
     is_recent,
     location_ok,
     role_relevant,
-    no_excluded_keywords,
     is_dutch,
     compute_junior_score,
 )
@@ -43,12 +43,14 @@ def load_raw_jobs(path: str) -> List[Dict]:
 
 def extract_fields(job: Dict) -> Dict:
     """Flatten the pieces we need from the normalized CSV row."""
+    url = job.get("redirect_url", "") or job.get("url", "") or job.get("link", "")
     return {
         "created": job.get("created", ""),
         "location": job.get("location.display_name", ""),
         "title": job.get("title", "") or "",
         "description": job.get("description", "") or "",
-        "url": job.get("redirect_url", "") or "",
+        "url": url,
+        "canonical_url": url.split("?", 1)[0] if url else "",
         "company": job.get("company.display_name", "") or "",
         "search_term": job.get("search_term", "") or "",
         "salary_min": job.get("salary_min"),
@@ -85,11 +87,8 @@ def check_role(title: str, desc: str) -> Tuple[bool, str]:
 
 
 def check_excluded(text: str) -> Tuple[bool, str]:
-    norm = normalize(text)
-    for kw in EXCLUDE_KEYWORDS:
-        if normalize(kw) in norm:
-            return False, kw
-    return True, ""
+    hits = excluded_hits(text)
+    return (len(hits) == 0), (hits[0] if hits else "")
 
 
 def check_dutch(text: str) -> Tuple[bool, str]:
@@ -110,6 +109,59 @@ def summarize_counter(counter: Counter, top_n: int = 5, show_all: bool = False) 
     return ", ".join(f"{k}:{v}" for k, v in items)
 
 
+def compute_global_hits(jobs: List[Dict]) -> Tuple[Dict[str, Counter], Dict[str, int]]:
+    """
+    Count how often each keyword/filter would trigger when evaluated on all rows,
+    without stopping early because a previous filter removed the job.
+    """
+    hits = {
+        "bad_title": Counter(),
+        "role_forbidden": Counter(),
+        "role_required": Counter(),
+        "exclude_keywords": Counter(),
+    }
+    misc = {
+        "recency_fail": 0,
+        "location_fail": 0,
+        "dutch_detected": 0,
+        "junior_negative": 0,
+    }
+
+    for job in jobs:
+        title = job.get("title", "") or ""
+        desc = job.get("description", "") or ""
+        loc = job.get("location", "") or ""
+        created = job.get("created", "") or ""
+        norm_title = normalize(title)
+        norm_text = normalize(title + " " + desc)
+
+        for pat in BAD_TITLES:
+            if pat in norm_title:
+                hits["bad_title"][pat] += 1
+
+        for bad in ROLE_FORBIDDEN_KEYWORDS:
+            if bad in norm_text:
+                hits["role_forbidden"][bad] += 1
+
+        for good in ROLE_REQUIRED_KEYWORDS:
+            if good in norm_text:
+                hits["role_required"][good] += 1
+
+        for kw in excluded_hits(norm_text):
+            hits["exclude_keywords"][kw] += 1
+
+        if not is_recent(created, MAX_DAYS_OLD):
+            misc["recency_fail"] += 1
+        if not location_ok(loc):
+            misc["location_fail"] += 1
+        if is_dutch(title + " " + desc):
+            misc["dutch_detected"] += 1
+        if compute_junior_score(title, desc) < 0:
+            misc["junior_negative"] += 1
+
+    return hits, misc
+
+
 def analyze(raw_jobs: List[Dict], report_csv: str = None, show_all: bool = False):
     step_summaries = []
     bad_title_hits = Counter()
@@ -120,7 +172,9 @@ def analyze(raw_jobs: List[Dict], report_csv: str = None, show_all: bool = False
     report_rows = []
 
     # Start with all raw jobs
-    current = [extract_fields(j) for j in raw_jobs]
+    all_jobs = [extract_fields(j) for j in raw_jobs]
+    global_hits, global_misc = compute_global_hits(all_jobs)
+    current = list(all_jobs)
     print(f"[IMPACT] Loaded raw rows: {len(current)}")
 
     steps = [
@@ -194,7 +248,9 @@ def analyze(raw_jobs: List[Dict], report_csv: str = None, show_all: bool = False
 
     # Duplicate removal (same criteria as adzuna_fetch)
     df_passed = pd.DataFrame(passed_jobs)
-    duplicates_mask = df_passed.duplicated(subset=["url", "title", "company"], keep="first")
+    # Align dedup with adzuna_fetch: use canonical_url + title + company
+    subset_keys = ["canonical_url", "title", "company"]
+    duplicates_mask = df_passed.duplicated(subset=subset_keys, keep="first")
     duplicates_removed = int(duplicates_mask.sum())
     df_unique = df_passed.loc[~duplicates_mask].copy()
 
@@ -212,6 +268,16 @@ def analyze(raw_jobs: List[Dict], report_csv: str = None, show_all: bool = False
     print(f"- Dutch detected: {dutch_hits}")
     print(f"- Duplicates removed: {duplicates_removed}")
     print(f"- Final kept after dedup: {len(df_unique)}")
+
+    print("\n[IMPACT] Keyword hits across full dataset (no early-stop):")
+    print(f"- Bad title matches: {summarize_counter(global_hits['bad_title'], show_all=show_all)}")
+    print(f"- Forbidden role hits: {summarize_counter(global_hits['role_forbidden'], show_all=show_all)}")
+    print(f"- Required keyword presence: {summarize_counter(global_hits['role_required'], show_all=show_all)}")
+    print(f"- Exclude keyword matches: {summarize_counter(global_hits['exclude_keywords'], show_all=show_all)}")
+    print(f"- Recency failures: {global_misc['recency_fail']}")
+    print(f"- Location blocks: {global_misc['location_fail']}")
+    print(f"- Dutch detected (all rows): {global_misc['dutch_detected']}")
+    print(f"- Junior score < 0: {global_misc['junior_negative']}")
 
     if report_csv:
         # Mark duplicates in the report for the jobs that passed filters

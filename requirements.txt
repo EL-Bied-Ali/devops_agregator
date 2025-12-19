@@ -2,3 +2,4 @@ requests
 pandas
 langdetect
 rapidfuzz
+beautifulsoup4

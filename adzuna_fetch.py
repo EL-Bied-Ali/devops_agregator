@@ -37,6 +37,27 @@ BAD_TITLE_KEYWORDS = [
     " l3 ",
 ]
 
+# Phrases where senior/lead terms are benign (mentoring/supervision)
+EXCLUDE_EXCEPTIONS = [
+    "under guidance from senior",
+    "under guidance of senior",
+    "guidance from senior",
+    "under supervision of senior",
+    "supervision of senior",
+    "mentored by senior",
+    "mentored by a senior",
+    "supported by senior",
+    "working with senior engineers",
+    "supporting senior engineers",
+    "reporting to senior",
+    "reports to senior",
+    "managerial team",
+    "accountmanager",
+    "vergelijkbare vacatures senior",
+    "user hardware",
+    "hardware and peripherals",
+]
+
 
 def normalize(text: str) -> str:
     """Remove accents and lower-case."""
@@ -58,13 +79,20 @@ def fetch_adzuna_page(page: int, term: str, results_per_page: int = RESULTS_PER_
         "content-type": "application/json",
     }
     print(f"[ADZUNA] Fetch page {page} for '{term}'...")
-    try:
-        resp = requests.get(url, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"[WARN] Error on term='{term}' page={page}: {e}")
-        return None
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            # Retry on transient 5xx (e.g., 502)
+            if resp.status_code >= 500:
+                raise requests.HTTPError(f"{resp.status_code} {resp.reason}")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            print(f"[WARN] Error on term='{term}' page={page} attempt {attempt + 1}/3: {e}")
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+            else:
+                return None
 
 
 def is_recent(date_str, max_days: int) -> bool:
@@ -84,10 +112,25 @@ def location_ok(loc: str) -> bool:
     return True
 
 
+def excluded_hits(text: str) -> list[str]:
+    """Return list of excluded keywords, ignoring benign senior/lead contexts."""
+    norm = normalize(text)
+    norm_padded = f" {norm} "
+    for exc in EXCLUDE_EXCEPTIONS:
+        exc_norm = normalize(exc)
+        norm_padded = norm_padded.replace(f" {exc_norm} ", " ")
+        norm_padded = norm_padded.replace(exc_norm, " ")
+    hits = []
+    for kw in EXCLUDE_KEYWORDS:
+        n_kw = normalize(kw)
+        if f" {n_kw} " in norm_padded or n_kw in norm_padded:
+            hits.append(kw)
+    return hits
+
+
 def no_excluded_keywords(text: str) -> bool:
     """Return False if any excluded keyword appears."""
-    norm = normalize(text)
-    return not any(normalize(kw) in norm for kw in EXCLUDE_KEYWORDS)
+    return not excluded_hits(text)
 
 
 def is_dutch(text: str) -> bool:

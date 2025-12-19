@@ -1,0 +1,4 @@
+# Copy this file to config_secrets.py and fill in your real API keys.
+ADZUNA_APP_ID = "your_adzuna_app_id"
+ADZUNA_APP_KEY = "your_adzuna_app_key"
+JOOBLE_API_KEY = "your_jooble_api_key"

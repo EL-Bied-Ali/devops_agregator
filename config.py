@@ -1,7 +1,20 @@
-ADZUNA_APP_ID = "026d8627"
-ADZUNA_APP_KEY = "883990e03a21c61e376492c7e2ccf2ed"
+import os
 
-JOOBLE_API_KEY = "0120a851-1f04-402d-bd97-3c3ba48a4ac8"
+# API keys are loaded from config_secrets.py (not tracked) or environment variables.
+try:
+    from config_secrets import ADZUNA_APP_ID, ADZUNA_APP_KEY, JOOBLE_API_KEY  # type: ignore
+except ImportError:
+    ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID", "")
+    ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY", "")
+    JOOBLE_API_KEY = os.getenv("JOOBLE_API_KEY", "")
+
+# Validation: stop early if Adzuna keys are missing
+if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
+    raise RuntimeError("Missing Adzuna API credentials. Set env vars or config_secrets.py")
+# Jooble key can stay empty if you don't use Jooble
+if JOOBLE_API_KEY is None:
+    JOOBLE_API_KEY = ""
+
 # Laisser vide pour ne pas restreindre l'API Jooble (filtrage fait ensuite)
 JOOBLE_LOCATION = ""
 

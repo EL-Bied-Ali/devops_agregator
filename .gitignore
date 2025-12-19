@@ -9,3 +9,5 @@ __pycache__/
 
 # Data outputs
 data/*.csv
+config_secrets.py
+.env

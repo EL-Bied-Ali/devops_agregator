@@ -1,41 +1,67 @@
 # ===== adzuna_fetch.py =====
+import os
+import re
+import subprocess
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
+from html import unescape
+from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 from langdetect import LangDetectException, detect
 
+try:
+    import ftfy
+except Exception:
+    ftfy = None
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
 from config import (
     ADZUNA_APP_ID,
     ADZUNA_APP_KEY,
-    ADZUNA_FILTERED_CSV,
-    ADZUNA_RAW_CSV,
-    COUNTRY,
+    DEFAULT_FILTER_MODE,
     DEFAULT_PAGES,
+    EXPERIENCE_HARD_BLOCK_PHRASES,
+    EXPERIENCE_SOFT_BLOCK_PHRASES,
+    EXTRA_BAD_TITLE_KEYWORDS,
+    JOB_MODE,
     MAX_DAYS_OLD,
-    ALLOWED_LOCATIONS_KEYWORDS,
     MIN_DESCRIPTION_CHARS,
     PAGES_PER_TERM,
+    PRIORITY_TERMS,
     REQUIRE_DESCRIPTION,
     RESULTS_PER_PAGE,
     SEARCH_TERMS,
     EXCLUDE_KEYWORDS,
     ROLE_FORBIDDEN_KEYWORDS,
     ROLE_REQUIRED_KEYWORDS,
+    SPEED_ROLE_TARGETS,
+    SUPPORTED_CH_FOCUS,
+    SUPPORTED_FILTER_MODES,
+    SUPPORTED_MARKETS,
+    get_market_profile,
+    get_output_paths,
+    resolve_ch_focus,
+    resolve_filter_mode,
+    resolve_market,
 )
 
-BASE_URL = f"https://api.adzuna.com/v1/api/jobs/{COUNTRY}/search"
-
 # Title patterns to drop immediately
-BAD_TITLE_KEYWORDS = [
+DEFAULT_BAD_TITLE_KEYWORDS = [
     "senior",
     "medior",
     "principal",
     "expert",
     " l3 ",
 ]
+BAD_TITLE_KEYWORDS = DEFAULT_BAD_TITLE_KEYWORDS + list(EXTRA_BAD_TITLE_KEYWORDS)
 
 # Phrases where senior/lead terms are benign (mentoring/supervision)
 EXCLUDE_EXCEPTIONS = [
@@ -58,14 +84,258 @@ EXCLUDE_EXCEPTIONS = [
     "hardware and peripherals",
 ]
 
+ACTIVE_MARKET = ""
+ACTIVE_CH_FOCUS = "all"
+ACTIVE_FILTER_MODE = DEFAULT_FILTER_MODE
+ACTIVE_JOB_MODE = JOB_MODE
+ACTIVE_MARKET_PROFILE = {}
+ACTIVE_OUTPUT_PATHS = {}
+ACTIVE_PRIORITY_TERMS = {}
+BASE_URL = ""
 
-def normalize(text: str) -> str:
-    """Remove accents and lower-case."""
+AUTO_CLOSE_EXCEL_ON_LOCK = os.getenv("JOB_AUTO_CLOSE_EXCEL_ON_LOCK", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+FORCE_KILL_EXCEL_ON_LOCK = os.getenv("JOB_FORCE_KILL_EXCEL_ON_LOCK", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
+
+def configure_market(market: str = "", ch_focus: str = "") -> str:
+    """Configure market-specific country/location/language/output settings."""
+    global ACTIVE_MARKET, ACTIVE_CH_FOCUS, ACTIVE_MARKET_PROFILE, ACTIVE_OUTPUT_PATHS, ACTIVE_PRIORITY_TERMS, BASE_URL
+    global SEARCH_TERMS, EXCLUDE_KEYWORDS, ROLE_FORBIDDEN_KEYWORDS, ROLE_REQUIRED_KEYWORDS, BAD_TITLE_KEYWORDS
+
+    ACTIVE_MARKET = resolve_market(market)
+    ACTIVE_CH_FOCUS = resolve_ch_focus(ch_focus) if ACTIVE_MARKET == "ch" else "all"
+    ACTIVE_MARKET_PROFILE = get_market_profile(ACTIVE_MARKET, ACTIVE_CH_FOCUS)
+    ACTIVE_OUTPUT_PATHS = get_output_paths(ACTIVE_MARKET)
+    BASE_URL = f"https://api.adzuna.com/v1/api/jobs/{ACTIVE_MARKET_PROFILE['adzuna_country']}/search"
+    SEARCH_TERMS = list(ACTIVE_MARKET_PROFILE.get("search_terms", SEARCH_TERMS))
+    EXCLUDE_KEYWORDS = list(ACTIVE_MARKET_PROFILE.get("exclude_keywords", EXCLUDE_KEYWORDS))
+    ROLE_FORBIDDEN_KEYWORDS = list(ACTIVE_MARKET_PROFILE.get("role_forbidden_keywords", ROLE_FORBIDDEN_KEYWORDS))
+    ROLE_REQUIRED_KEYWORDS = list(ACTIVE_MARKET_PROFILE.get("role_required_keywords", ROLE_REQUIRED_KEYWORDS))
+    BAD_TITLE_KEYWORDS = list(DEFAULT_BAD_TITLE_KEYWORDS) + list(
+        ACTIVE_MARKET_PROFILE.get("extra_bad_title_keywords", [])
+    )
+    ACTIVE_PRIORITY_TERMS = dict(PRIORITY_TERMS)
+    if ACTIVE_MARKET == "ch":
+        ACTIVE_PRIORITY_TERMS.update(
+            {
+                "it support": 8,
+                "support informatique": 8,
+                "application support engineer": 8,
+                "system administrator": 8,
+                "linux system administrator": 8,
+                "cloud support": 8,
+                "it operations": 7,
+                "operations engineer": 7,
+                "network operations engineer": 7,
+                "security operations engineer": 6,
+                "it trainee": 6,
+                "it intern": 6,
+                "stage informatique": 5,
+                "junior": 4,
+                "graduate": 3,
+            }
+        )
+    return ACTIVE_MARKET
+
+
+configure_market()
+
+
+def clean_text(text: str) -> str:
+    """Best-effort fix for common mojibake sequences from source feeds."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+
+    if ftfy is not None:
+        try:
+            text = ftfy.fix_text(text)
+        except Exception:
+            pass
+
+    common_replacements = {
+        "\xC3\xA9": "\u00e9",
+        "\xC3\xA8": "\u00e8",
+        "\xC3\xAA": "\u00ea",
+        "\xC3\xAB": "\u00eb",
+        "\xC3\xA0": "\u00e0",
+        "\xC3\xA2": "\u00e2",
+        "\xC3\xA7": "\u00e7",
+        "\xC3\xB9": "\u00f9",
+        "\xC3\xBB": "\u00fb",
+        "\xC3\xB4": "\u00f4",
+        "\xC3\xAE": "\u00ee",
+        "\xC3\xAF": "\u00ef",
+        "\xC3\x83\xC2\xA9": "\u00e9",
+        "\xC3\x83\xC2\xA8": "\u00e8",
+        "\xC3\x83\xC2\xAA": "\u00ea",
+        "\xC3\x83\xC2\xAB": "\u00eb",
+        "\xE2\x80\x99": "'",
+        "\xE2\x80\x93": "-",
+        "\xE2\x80\x94": "-",
+        "\xE2\x80\x9C": '"',
+        "\xE2\x80\x9D": '"',
+        "ÃƒÂ©": "\u00e9",
+        "ÃƒÂ¨": "\u00e8",
+        "ÃƒÂª": "\u00ea",
+        "ÃƒÂ«": "\u00eb",
+        "ÃƒÂ ": "\u00e0",
+        "ÃƒÂ¢": "\u00e2",
+        "ÃƒÂ§": "\u00e7",
+        "ÃƒÂ¹": "\u00f9",
+        "ÃƒÂ»": "\u00fb",
+        "ÃƒÂ´": "\u00f4",
+        "ÃƒÂ®": "\u00ee",
+        "ÃƒÂ¯": "\u00ef",
+        "Ã¢â‚¬â„¢": "'",
+        "Ã¢â‚¬â€œ": "-",
+        "Ã¢â‚¬â€": "-",
+        "Ã¢â‚¬Å“": '"',
+        "Ã¢â‚¬\x9d": '"',
+    }
+    for broken, fixed in common_replacements.items():
+        text = text.replace(broken, fixed)
+
+    return text
+
+
+_HTML_SIGNAL_PATTERN = re.compile(r"<\s*(html|body|div|span|p|br|ul|li|section|article|script|style)\b", flags=re.I)
+_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+_SCRIPT_STYLE_PATTERN = re.compile(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>")
+
+
+def looks_like_html(text: str) -> bool:
+    raw = str(text or "")
+    if not raw:
+        return False
+    if _HTML_SIGNAL_PATTERN.search(raw):
+        return True
+    if len(_HTML_TAG_PATTERN.findall(raw)) >= 4:
+        return True
+    return False
+
+
+def html_to_plain_text(text: str) -> str:
+    raw = unescape(clean_text(text or ""))
+    if not raw:
+        return ""
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(raw, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        plain = " ".join(chunk.strip() for chunk in soup.stripped_strings)
+    else:
+        plain = _SCRIPT_STYLE_PATTERN.sub(" ", raw)
+        plain = _HTML_TAG_PATTERN.sub(" ", plain)
+    plain = re.sub(r"\s+", " ", plain).strip()
+    return plain
+
+
+def rule_plain_text(text: Any) -> str:
+    if text is None:
+        return ""
+    raw = unescape(clean_text(str(text)))
+    if not raw:
+        return ""
+    if looks_like_html(raw):
+        return html_to_plain_text(raw)
+    if "<" in raw and ">" in raw and _HTML_TAG_PATTERN.search(raw):
+        raw = _SCRIPT_STYLE_PATTERN.sub(" ", raw)
+        raw = _HTML_TAG_PATTERN.sub(" ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw
+
+
+def normalize_text(text: str) -> str:
+    """Canonical normalization for filtering and scoring."""
+    text = rule_plain_text(text)
     if not text:
         return ""
+    text = text.lower()
     text = unicodedata.normalize("NFD", text)
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
-    return text.lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def normalize(text: str) -> str:
+    """Backward-compatible alias."""
+    return normalize_text(text)
+
+
+def job_text_for_rules(job: dict | None = None, **overrides) -> tuple[str, str]:
+    """
+    Build normalized + cleaned plain text for rules from title/description/company/location.
+    Returns: (normalized_text, cleaned_text)
+    """
+    payload = dict(job or {})
+    payload.update({k: v for k, v in overrides.items() if v is not None})
+    title = rule_plain_text(payload.get("title", ""))
+    desc = rule_plain_text(payload.get("description", ""))
+    company_val = payload.get("company", "")
+    if isinstance(company_val, dict):
+        company_val = company_val.get("display_name", "") or company_val.get("name", "")
+    company = rule_plain_text(company_val)
+    loc = payload.get("location", "") or payload.get("location.display_name", "")
+    if isinstance(loc, dict):
+        loc = loc.get("display_name", "")
+    location = rule_plain_text(loc)
+    combined = " ".join(part for part in [title, desc, company, location] if part).strip()
+    return normalize_text(combined), combined
+
+
+def keyword_hit(text: str, keyword: str, boundary_only: bool = True) -> bool:
+    """
+    Keyword match with safer boundaries to reduce substring false positives.
+    Example fixed: expert vs expertise, host vs hosting, coo vs coordinate.
+    """
+    txt = normalize(text or "")
+    kw = normalize(keyword or "").strip()
+    if not txt or not kw:
+        return False
+
+    if boundary_only and re.fullmatch(r"[a-z0-9 ]+", kw):
+        pattern = r"(?<![a-z0-9])" + re.escape(kw).replace(r"\ ", r"\s+") + r"(?![a-z0-9])"
+        return re.search(pattern, txt) is not None
+
+    return kw in txt
+
+
+def extract_adzuna_job_id(url: str) -> str:
+    """Extract numeric job id from Adzuna details/land URLs."""
+    if not url:
+        return ""
+    m = re.search(r"/(?:details|land/ad)/(\d+)", str(url))
+    return m.group(1) if m else ""
+
+
+def canonicalize_url(url: str) -> str:
+    """
+    Build a stable canonical URL for dedup/tracking.
+    - Strip query params
+    - Normalize Adzuna land/ad URLs to details/<id> when possible
+    """
+    base = (url or "").split("?", 1)[0].strip()
+    if not base:
+        return ""
+    parsed = urlparse(base)
+    netloc = (parsed.netloc or "").lower()
+    if "adzuna." in netloc:
+        job_id = extract_adzuna_job_id(base)
+        if job_id and parsed.scheme:
+            return f"{parsed.scheme}://{parsed.netloc}/details/{job_id}"
+    return base
 
 
 def fetch_adzuna_page(page: int, term: str, results_per_page: int = RESULTS_PER_PAGE):
@@ -107,9 +377,96 @@ def is_recent(date_str, max_days: int) -> bool:
     return dt > limit
 
 
-def location_ok(loc: str) -> bool:
-    """Accept all locations; Dutch filter will remove NL-only ads."""
-    return True
+REMOTE_TERMS = [
+    "remote",
+    "fully remote",
+    "teletravail",
+    "telework",
+    "work from home",
+    "home office",
+    "wfh",
+    "distributed",
+]
+
+HYBRID_TERMS = [
+    "hybrid",
+    "hybride",
+    "2 days onsite",
+    "3 days onsite",
+]
+
+ONSITE_TERMS = [
+    "on site",
+    "on-site",
+    "onsite",
+    "presentiel",
+    "office based",
+    "site based",
+]
+
+
+def detect_work_mode(title: str, desc: str, loc: str) -> str:
+    """Return remote/hybrid/onsite/unknown from job text hints."""
+    text = normalize_text(f"{title or ''} {desc or ''} {loc or ''}")
+    has_hybrid = any(keyword_hit(text, term, boundary_only=True) for term in HYBRID_TERMS)
+    has_remote = any(keyword_hit(text, term, boundary_only=True) for term in REMOTE_TERMS)
+    has_onsite = any(keyword_hit(text, term, boundary_only=True) for term in ONSITE_TERMS)
+
+    if has_hybrid:
+        return "hybrid"
+    if has_remote and has_onsite:
+        return "hybrid"
+    if has_remote:
+        return "remote"
+    if has_onsite:
+        return "onsite"
+    return "unknown"
+
+
+def is_remote_job(title: str, desc: str, loc: str) -> bool:
+    return detect_work_mode(title, desc, loc) in {"remote", "hybrid"}
+
+
+def location_ok(loc: str, title: str = "", desc: str = "") -> bool:
+    """Return True if location is acceptable for the active market."""
+    if ACTIVE_MARKET == "ch" and is_remote_job(title, desc, loc):
+        combined = normalize(f"{loc or ''} {title or ''} {desc or ''}")
+        foreign_keywords = ACTIVE_MARKET_PROFILE.get("foreign_location_keywords", [])
+        has_foreign = any(normalize(kw) in combined for kw in foreign_keywords)
+        swiss_markers = ACTIVE_MARKET_PROFILE.get("allowed_location_keywords", [])
+        has_swiss = any(normalize(marker) in combined for marker in swiss_markers)
+        return not (has_foreign and not has_swiss)
+
+    if not ACTIVE_MARKET_PROFILE.get("enforce_location_filter", True):
+        # Relaxed mode for CH: don't care about canton/city, but avoid clearly foreign jobs.
+        if ACTIVE_MARKET != "ch":
+            return True
+
+        combined = normalize(f"{loc or ''} {title or ''} {desc or ''}")
+        foreign_keywords = ACTIVE_MARKET_PROFILE.get("foreign_location_keywords", [])
+        has_foreign = any(normalize(kw) in combined for kw in foreign_keywords)
+
+        swiss_markers = ACTIVE_MARKET_PROFILE.get("allowed_location_keywords", [])
+        has_swiss = any(normalize(marker) in combined for marker in swiss_markers)
+
+        if has_foreign and not has_swiss:
+            return False
+        return True
+
+    if loc:
+        norm_loc = normalize(loc)
+        blocked_keywords = ACTIVE_MARKET_PROFILE.get("blocked_location_keywords", [])
+        if any(normalize(kw) in norm_loc for kw in blocked_keywords):
+            return False
+
+    keywords = ACTIVE_MARKET_PROFILE.get("allowed_location_keywords", [])
+    if not keywords:
+        return True
+    if not loc:
+        # Keep unknown locations to avoid false negatives from sparse APIs.
+        return True
+    norm_loc = normalize(loc)
+    return any(normalize(kw) in norm_loc for kw in keywords)
 
 
 def excluded_hits(text: str) -> list[str]:
@@ -122,8 +479,7 @@ def excluded_hits(text: str) -> list[str]:
         norm_padded = norm_padded.replace(exc_norm, " ")
     hits = []
     for kw in EXCLUDE_KEYWORDS:
-        n_kw = normalize(kw)
-        if f" {n_kw} " in norm_padded or n_kw in norm_padded:
+        if keyword_hit(norm_padded, kw, boundary_only=True):
             hits.append(kw)
     return hits
 
@@ -133,34 +489,796 @@ def no_excluded_keywords(text: str) -> bool:
     return not excluded_hits(text)
 
 
-def is_dutch(text: str) -> bool:
-    """Return True if language looks Dutch."""
+LEAD_TITLE_MARKERS = [
+    "lead",
+    "team lead",
+    "tech lead",
+    "technical lead",
+    "chapter lead",
+    "manager",
+    "head of",
+    "director",
+]
+
+
+def title_has_lead_or_manager(title: str) -> bool:
+    title_norm = normalize_text(title or "")
+    return any(keyword_hit(title_norm, marker, boundary_only=True) for marker in LEAD_TITLE_MARKERS)
+
+
+def classify_excluded_hits(title: str, text: str) -> tuple[list[str], list[str]]:
+    """
+    Split exclude hits into hard vs soft.
+    Lead mentions outside title are kept for manual review (soft).
+    """
+    hits = excluded_hits(text)
+    if not hits:
+        return [], []
+
+    hard_hits: list[str] = []
+    soft_hits: list[str] = []
+    title_is_lead = title_has_lead_or_manager(title)
+    for hit in hits:
+        if normalize_text(hit) == "lead" and not title_is_lead:
+            soft_hits.append("lead_soft")
+        else:
+            hard_hits.append(hit)
+    return hard_hits, soft_hits
+
+
+LANGUAGE_TERMS = {
+    "fr": ["french", "francais", "francophone"],
+    "en": ["english", "anglais", "anglophone"],
+    "nl": ["dutch", "nederlands", "neerlandais"],
+    "de": ["german", "deutsch", "allemand"],
+}
+
+LANGUAGE_REQUIRED_PATTERNS = {
+    "nl": [
+        r"\bdutch\s+(?:is\s+)?mandatory\b",
+        r"\bmandatory\s+dutch\b",
+        r"\bmust\s+speak\s+dutch\b",
+        r"\bdutch\s+required\b",
+        r"\bfluent\s+dutch\s+required\b",
+        r"\bexcellent\s+command\s+of\s+dutch\b",
+        r"\bnative\s+dutch\b",
+        r"\bbilingual\s+dutch\b",
+        r"\bnederlands\s+vereist\b",
+        r"\bnederlands\s+is\s+verplicht\b",
+        r"\bnederlands\s+verplicht\b",
+        r"\bmoet\s+nederlands\s+spreken\b",
+        r"\bgoede\s+kennis\s+(?:van\s+)?nederlands\s+is\s+vereist\b",
+        r"\bbonne\s+maitrise\s+du\s+neerlandais\b",
+        r"\bbonne\s+maitrise\s+du\s+francais\s+et\s+du\s+neerlandais\b",
+    ],
+    "de": [
+        r"\bgerman\s+(?:is\s+)?mandatory\b",
+        r"\bmandatory\s+german\b",
+        r"\bmust\s+speak\s+german\b",
+        r"\bgerman\s+required\b",
+        r"\bfluent\s+german\s+required\b",
+        r"\bexcellent\s+command\s+of\s+german\b",
+        r"\bnative\s+german\b",
+        r"\bdeutsch\s+erforderlich\b",
+        r"\bdeutschkenntnisse\s+erforderlich\b",
+        r"\ballemand\s+obligatoire\b",
+        r"\ballemand\s+requis\b",
+    ],
+}
+
+LANGUAGE_OPTIONAL_PATTERNS = {
+    "nl": [
+        r"\bdutch\s+is\s+a\s+plus\b",
+        r"\bnice\s+to\s+have\s+dutch\b",
+        r"\bdutch\s+is\s+an\s+asset\b",
+        r"\bnederlands\s+is\s+een\s+plus\b",
+        r"\bkennis\s+van\s+nederlands\s+is\s+een\s+plus\b",
+        r"\bneerlandais\s+(?:est|serait)\s+un\s+plus\b",
+    ]
+}
+
+LANGUAGE_REQUIRED_CUE_RE = re.compile(
+    r"\b(required|mandatory|must\s+speak|must\s+have|obligatoire|obligatoirement|requis|requise|"
+    r"verplicht|vereist|fluent|native|excellent\s+command|strong\s+command|good\s+command|"
+    r"very\s+good\s+knowledge|good\s+knowledge|bonne\s+maitrise|maitrise|goede\s+kennis)\b"
+)
+LANGUAGE_OPTIONAL_CUE_RE = re.compile(r"\b(plus|nice\s+to\s+have|asset|serait\s+un\s+plus|est\s+un\s+plus)\b")
+LANGUAGE_ALTERNATIVE_RE = re.compile(r"\b(or|ou|of)\b")
+LANGUAGE_TRILINGUAL_RE = re.compile(r"\b(trilingual|trilingue|drie(?:talig|talige))\b")
+LANGUAGE_ALT_PAIR_RE = re.compile(
+    r"\b(?:french|francais|english|anglais|dutch|nederlands|neerlandais|german|deutsch|allemand)\b\s*"
+    r"(?:/|or|ou|of)\s*"
+    r"\b(?:french|francais|english|anglais|dutch|nederlands|neerlandais|german|deutsch|allemand)\b"
+)
+ACCEPTABLE_FR_NL_ALTERNATIVE_PATTERNS = [
+    r"\bdutch\s+or\s+french\b",
+    r"\bfrench\s+or\s+dutch\b",
+    r"\bdutch\s*/\s*french\b",
+    r"\bfrench\s*/\s*dutch\b",
+    r"\bat\s+least\s+one\s+of\s+(?:french|dutch)\s*(?:/|or)\s*(?:french|dutch)\b",
+]
+BLOCKED_LANGUAGE_TERM_THEN_REQUIREMENT_RE = re.compile(
+    r"\b(dutch|nederlands|neerlandais|german|deutsch|allemand)\b.{0,24}"
+    r"\b(required|mandatory|must|obligatoire|verplicht|vereist|fluent|native)\b"
+)
+
+
+def _extract_language_codes(text_norm: str) -> set[str]:
+    found: set[str] = set()
+    for code, terms in LANGUAGE_TERMS.items():
+        for term in terms:
+            if keyword_hit(text_norm, term, boundary_only=True):
+                found.add(code)
+                break
+    return found
+
+
+def _snippet(text_norm: str, max_len: int = 140) -> str:
+    value = " ".join((text_norm or "").split())
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 3].rstrip() + "..."
+
+
+def language_requirements(text: str) -> dict:
+    """
+    Parse explicit language requirements from normalized text.
+    Returns:
+      {
+        "required_langs": set[str],
+        "optional_langs": set[str],
+        "evidence": list[str],
+        "alternative_language_option": bool,
+      }
+    """
+    norm = normalize_text(text or "")
+    required_langs: set[str] = set()
+    optional_langs: set[str] = set()
+    evidence: list[str] = []
+    alternative_language_option = False
+    alternative_langs: set[str] = set()
+
+    if not norm:
+        return {
+            "required_langs": required_langs,
+            "optional_langs": optional_langs,
+            "evidence": evidence,
+            "alternative_language_option": alternative_language_option,
+            "alternative_langs": alternative_langs,
+        }
+
+    clauses = [chunk.strip() for chunk in re.split(r"[;,\n\.\|]+", norm) if chunk.strip()]
+    for clause in clauses:
+        langs = _extract_language_codes(clause)
+        if not langs:
+            continue
+
+        optional_hit = LANGUAGE_OPTIONAL_CUE_RE.search(clause) is not None
+        for code, patterns in LANGUAGE_OPTIONAL_PATTERNS.items():
+            if any(re.search(pat, clause) for pat in patterns):
+                optional_hit = True
+                if code in langs:
+                    optional_langs.add(code)
+
+        required_hit = LANGUAGE_REQUIRED_CUE_RE.search(clause) is not None
+        for code, patterns in LANGUAGE_REQUIRED_PATTERNS.items():
+            if any(re.search(pat, clause) for pat in patterns):
+                required_hit = True
+                if code in langs:
+                    required_langs.add(code)
+
+        # Ex: "English and Dutch (mandatory speaking)"
+        and_combo = len(langs) >= 2 and re.search(r"\b(and|et|en|&)\b", clause)
+        if and_combo and required_hit:
+            required_langs.update(langs)
+
+        trilingual = LANGUAGE_TRILINGUAL_RE.search(clause) is not None and len(langs) >= 2
+        if trilingual:
+            required_langs.update(langs)
+            required_hit = True
+
+        alternative = len(langs) >= 2 and LANGUAGE_ALT_PAIR_RE.search(clause) is not None
+        if alternative:
+            alternative_language_option = True
+            alternative_langs.update(langs)
+            if _snippet(clause) not in evidence:
+                evidence.append(_snippet(clause))
+            # "French or Dutch" is an alternative, not a hard requirement for Dutch.
+            continue
+
+        if optional_hit and not required_hit:
+            optional_langs.update(langs)
+            if _snippet(clause) not in evidence:
+                evidence.append(_snippet(clause))
+            continue
+
+        if required_hit:
+            required_langs.update(langs)
+            if _snippet(clause) not in evidence:
+                evidence.append(_snippet(clause))
+
+    return {
+        "required_langs": required_langs,
+        "optional_langs": optional_langs,
+        "evidence": evidence[:5],
+        "alternative_language_option": alternative_language_option,
+        "alternative_langs": alternative_langs,
+    }
+
+
+def blocked_language_requirement_reason(text: str) -> str:
+    # "Dutch or French" is acceptable for this profile (French available).
+    if has_acceptable_language_alternative(text):
+        return ""
+
+    req = language_requirements(text)
+    required = set(req.get("required_langs", set()))
+    blocked_codes = set(ACTIVE_MARKET_PROFILE.get("blocked_language_codes", []))
+    blocked_required = required.intersection(blocked_codes)
+    if not blocked_required:
+        return ""
+    if "nl" in blocked_required:
+        return "blocked_language_req:dutch_required"
+    if "de" in blocked_required:
+        return "blocked_language_req:german_required"
+    blocked_label = sorted(blocked_required)[0]
+    return f"blocked_language_req:{blocked_label}_required"
+
+
+def language_manual_review_reason(text: str) -> str:
+    if has_acceptable_language_alternative(text):
+        return ""
+
+    req = language_requirements(text)
+    alt_langs = set(req.get("alternative_langs", set()))
+    if req.get("alternative_language_option") and alt_langs.intersection({"nl", "de"}):
+        if alt_langs.intersection({"fr"}):
+            return ""
+        return "language_alternative:blocked_language_option"
+    return ""
+
+
+def has_blocked_language_requirement(text: str) -> bool:
+    """Return True when blocked language is explicitly required in text."""
+    return bool(blocked_language_requirement_reason(text))
+
+
+def has_acceptable_language_alternative(text: str) -> bool:
+    """
+    Return True when the ad offers an FR/NL alternative (acceptable for this profile),
+    as long as Dutch/German is not explicitly marked mandatory elsewhere.
+    """
+    norm = normalize_text(text or "")
+    if not norm:
+        return False
+
+    has_alt = any(re.search(pattern, norm) for pattern in ACCEPTABLE_FR_NL_ALTERNATIVE_PATTERNS)
+    if not has_alt:
+        return False
+
+    # Trilingual profiles are explicit multi-language requirements, not alternatives.
+    if LANGUAGE_TRILINGUAL_RE.search(norm):
+        return False
+
+    if BLOCKED_LANGUAGE_TERM_THEN_REQUIREMENT_RE.search(norm):
+        return False
+
+    # Guardrail: keep blocking if text also contains explicit NL/DE mandatory wording.
+    explicit_block_patterns = LANGUAGE_REQUIRED_PATTERNS.get("nl", []) + LANGUAGE_REQUIRED_PATTERNS.get("de", [])
+    if any(re.search(pattern, norm) for pattern in explicit_block_patterns):
+        return False
+    return True
+
+
+INTERNSHIP_ALLOW_MARKERS = [
+    "graduate program",
+    "early careers",
+    "new grad",
+    "entry-level program",
+    "entry level program",
+    "no internship agreement required",
+    "open to graduates",
+    "open to graduate",
+]
+
+INTERNSHIP_AGREEMENT_MARKERS = [
+    "internship agreement",
+    "convention de stage",
+    "stage agreement",
+]
+
+INTERNSHIP_STUDENT_ONLY_MARKERS = [
+    "must be enrolled",
+    "currently enrolled",
+    "student",
+    "etudiant",
+    "universite",
+    "campus",
+]
+
+INTERNSHIP_THESIS_MARKERS = [
+    "master thesis",
+    "thesis",
+    "memoire",
+]
+
+INTERNSHIP_STAGE_MARKERS = [
+    "stage",
+    "stagiaire",
+]
+
+INTERNSHIP_INTERN_MARKERS = [
+    "internship",
+    "intern",
+]
+
+EXPERIENCE_JUNIOR_TITLE_MARKERS = [
+    "junior",
+    "graduate",
+    "entry level",
+    "entry-level",
+    "trainee",
+    "new grad",
+    "early careers",
+]
+
+
+EXPERIENCE_SOFT_SIGNAL_PHRASES = [
+    "experience confirmee",
+    "experience significative",
+    "experience solide",
+    "profil confirme",
+    "confirmed experience",
+    "strong experience",
+    "solid experience",
+    "proven experience",
+]
+
+EXPERIENCE_YEARS_PATTERNS = [
+    r"\b(?:at\s+least|min(?:imum)?\.?|minimum|required|requise|au\s+moins)\s*(?:de\s*)?(?P<years>\d{1,2})\+?\s*(?:years?|yrs?|ans?)\b",
+    r"\b(?P<years>\d{1,2})\+?\s*(?:years?|yrs?|ans?)\s+(?:of\s+)?experience\b",
+    r"\bexperience\s+(?:de|d['’]|minimum|minimale|minimal|required|requise|confirmee|significative|solide)?\s*(?:de\s*)?(?P<years>\d{1,2})\+?\s*(?:ans|years?)\b",
+    r"\b(?P<years>\d{1,2})\+?\s*(?:ans|years?)\s+d['’]?\s*experience\b",
+    r"\b(?P<years>\d{1,2})\+?\s*(?:years?|yrs?|ans?)\b",
+]
+
+EXPERIENCE_RANGE_PATTERNS = [
+    r"\b(?P<start>\d{1,2})\s*(?:-|to|a)\s*(?P<end>\d{1,2})\s*(?:years?|ans?)\b",
+]
+
+def _near_experience_context(text_norm: str, start: int, end: int) -> bool:
+    window = text_norm[max(0, start - 40) : min(len(text_norm), end + 40)]
+    return "experience" in window
+
+
+def _years_from_text(text: str) -> int | None:
+    match = re.search(r"\b(\d{1,2})\b", normalize_text(text or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _match_phrase_list(text_norm: str, phrases: list[str]) -> str:
+    for phrase in phrases:
+        phrase_norm = normalize_text(phrase or "").strip()
+        if phrase_norm and keyword_hit(text_norm, phrase_norm, boundary_only=True):
+            return phrase
+    return ""
+
+
+def _extract_years_required(text_norm: str) -> tuple[int | None, str]:
+    candidates: list[tuple[int, str]] = []
+    max_reasonable_years = 15
+
+    for pattern in EXPERIENCE_RANGE_PATTERNS:
+        for match in re.finditer(pattern, text_norm):
+            start = int(match.group("start"))
+            end = int(match.group("end"))
+            if start > max_reasonable_years or end > max_reasonable_years:
+                continue
+            if end < start:
+                continue
+            if _near_experience_context(text_norm, match.start(), match.end()):
+                candidates.append((start, match.group(0)))
+
+    for pattern in EXPERIENCE_YEARS_PATTERNS:
+        for match in re.finditer(pattern, text_norm):
+            years = int(match.group("years"))
+            if years > max_reasonable_years:
+                continue
+            token = match.group(0)
+            if "experience" in token or _near_experience_context(text_norm, match.start(), match.end()):
+                candidates.append((years, token))
+
+    if not candidates:
+        return None, ""
+
+    # Use the strongest explicit requirement.
+    years_required = max(years for years, _ in candidates)
+    return years_required, f"{years_required}+ years"
+
+
+def internship_student_only_detail(title: str, desc: str) -> str:
+    """
+    Return blocking detail for student-only internships, else empty string.
+    """
+    text = normalize((title or "") + " " + (desc or ""))
+    if not text:
+        return ""
+
+    if any(keyword_hit(text, marker, boundary_only=True) for marker in INTERNSHIP_ALLOW_MARKERS):
+        return ""
+
+    if any(keyword_hit(text, marker, boundary_only=True) for marker in INTERNSHIP_AGREEMENT_MARKERS):
+        return "internship_agreement_required"
+
+    if any(keyword_hit(text, marker, boundary_only=True) for marker in INTERNSHIP_STUDENT_ONLY_MARKERS):
+        return "student_only_keyword"
+
+    if any(keyword_hit(text, marker, boundary_only=True) for marker in INTERNSHIP_THESIS_MARKERS):
+        return "thesis_keyword"
+
+    return ""
+
+
+def internship_generic_detail(title: str, desc: str) -> str:
+    """
+    Return manual-review detail for generic internship wording (not explicit student-only).
+    """
+    text = normalize((title or "") + " " + (desc or ""))
+    if not text:
+        return ""
+
+    if any(keyword_hit(text, marker, boundary_only=True) for marker in INTERNSHIP_ALLOW_MARKERS):
+        return ""
+
+    if internship_student_only_detail(title, desc):
+        return ""
+
+    if any(keyword_hit(text, marker, boundary_only=True) for marker in INTERNSHIP_STAGE_MARKERS):
+        return "stage_keyword"
+
+    if any(keyword_hit(text, marker, boundary_only=True) for marker in INTERNSHIP_INTERN_MARKERS):
+        return "internship_keyword"
+
+    return ""
+
+
+def is_internship_student_only(title: str, desc: str) -> bool:
+    return bool(internship_student_only_detail(title, desc))
+
+
+def detect_experience_requirement_details(title: str, desc: str) -> tuple[str, str, int | None]:
+    """
+    Detect explicit experience constraints.
+    Returns (level, detail, years_required):
+      - hard for 5+ years
+      - soft / soft_junior_title for 3-4 years
+      - none for 0-1 or no signal
+    """
+    title_norm = normalize_text(title or "")
+    text_norm = normalize_text(f"{title or ''} {desc or ''}")
+    if not text_norm:
+        return "none", "", None
+
+    has_junior_title = any(keyword_hit(title_norm, marker, boundary_only=True) for marker in EXPERIENCE_JUNIOR_TITLE_MARKERS)
+
+    years_required, detail = _extract_years_required(text_norm)
+    if years_required is not None:
+        if years_required >= 5:
+            if has_junior_title:
+                return "soft_junior_title", detail, years_required
+            return "hard", detail, years_required
+        if years_required >= 3:
+            if has_junior_title:
+                return "soft_junior_title", detail, years_required
+            return "soft", detail, years_required
+        return "none", "", years_required
+
+    hard_phrase = _match_phrase_list(text_norm, EXPERIENCE_HARD_BLOCK_PHRASES)
+    if hard_phrase:
+        years_from_phrase = _years_from_text(hard_phrase)
+        if has_junior_title:
+            return "soft_junior_title", hard_phrase, years_from_phrase
+        return "hard", hard_phrase, years_from_phrase
+
+    soft_phrase = _match_phrase_list(text_norm, EXPERIENCE_SOFT_BLOCK_PHRASES)
+    if soft_phrase:
+        years_from_phrase = _years_from_text(soft_phrase)
+        if years_from_phrase is not None and years_from_phrase <= 2:
+            return "none", "", years_from_phrase
+        return ("soft_junior_title" if has_junior_title else "soft", soft_phrase, years_from_phrase)
+
+    for marker in EXPERIENCE_SOFT_SIGNAL_PHRASES:
+        if keyword_hit(text_norm, marker, boundary_only=True):
+            return ("soft_junior_title" if has_junior_title else "soft", marker, None)
+
+    return "none", "", None
+
+
+def detect_experience_requirement(title: str, desc: str) -> tuple[str, str]:
+    level, detail, _years_required = detect_experience_requirement_details(title, desc)
+    return level, detail
+
+
+def extract_years_required(title: str, desc: str) -> int | None:
+    _level, _detail, years_required = detect_experience_requirement_details(title, desc)
+    return years_required
+
+
+def is_disallowed_language(text: str) -> bool:
+    """Return True if detected dominant language is disallowed for the active market."""
+    blocked_codes = set(ACTIVE_MARKET_PROFILE.get("blocked_language_codes", []))
+    if not blocked_codes:
+        return False
+
     try:
         snippet = (text or "")[:800]
         if not snippet.strip():
             return False
 
-        norm = normalize(snippet)
-        if " nederlands " in f" {norm} " or " dutch " in f" {norm} ":
-            return True
-
         lang = detect(snippet)
-        return lang == "nl"
+        return lang in blocked_codes
     except LangDetectException:
         return False
     except Exception:
         return False
 
 
-def role_relevant(title: str, desc: str) -> bool:
-    """Keep infra / cloud / devops roles, drop forbidden ones."""
+def is_dutch(text: str) -> bool:
+    """Backward-compatible alias for legacy imports."""
+    return is_disallowed_language(text)
+
+
+def training_program_relevant(title: str, desc: str) -> bool:
+    """Allow trainee/graduate programs only when they look CS/IT-related."""
     text = normalize((title or "") + " " + (desc or ""))
+    training_markers = [
+        "graduate",
+        "trainee",
+        "intern",
+        "internship",
+        "stagiaire",
+        "praktikant",
+        "stage",
+        "entry level",
+        "formation",
+    ]
+    cs_markers = [
+        "it",
+        "ict",
+        "computer",
+        "informatique",
+        "informaticien",
+        "informatiker",
+        "cloud",
+        "system",
+        "linux",
+        "network",
+        "application support",
+        "helpdesk",
+        "service desk",
+        "support",
+        "platform",
+        "devops",
+        "infrastructure",
+    ]
+    has_training_marker = any(keyword_hit(text, marker, boundary_only=True) for marker in training_markers)
+    has_cs_marker = any(keyword_hit(text, marker, boundary_only=True) for marker in cs_markers)
+    return has_training_marker and has_cs_marker
+
+
+ROLE_TITLE_FALLBACK_KEYWORDS = [
+    "it support",
+    "support it",
+    "support informatique",
+    "helpdesk",
+    "service desk",
+    "servicedesk",
+    "technicien support",
+    "support n1",
+    "support n2",
+    "support n3",
+    "technical support",
+    "support technique",
+    "it supporter",
+    "ict supporter",
+    "supporttechniker",
+    "it-support",
+    "it support specialist",
+    "application support",
+    "administrateur systeme",
+    "administrateur systemes",
+    "administratrice systeme",
+    "administratrice systemes",
+    "system administrator",
+    "systems administrator",
+    "network administrator",
+    "administrateur reseau",
+    "network engineer",
+    "ingenieur reseau",
+    "system admin",
+    "systemadministrator",
+    "it-systemadministrator",
+    "it administrator",
+    "it administratorin",
+    "it-administrator",
+    "ingenieur systeme",
+    "ingenieur systemes",
+    "ingenieur linux",
+    "ict system engineer",
+    "it infrastructure specialist",
+    "test automation engineer",
+    "qa automation engineer",
+    "build engineer",
+    "release engineer",
+    "informaticien",
+    "informatiker",
+]
+
+ROLE_TITLE_FALLBACK_PATTERNS = [
+    r"\badministrat(?:eur|rice)(?:[-/\s]trice)?\b.{0,20}\bsystem",
+    r"\badministrat(?:eur|rice)(?:[-/\s]trice)?\b.{0,20}\breseau",
+    r"\b(system|network)\b.{0,25}\b(network|system)\b.{0,15}\badministrator\b",
+    r"\bit[-\s]?administrator(?:in)?\b",
+    r"\bit[-\s]?support\b",
+    r"\bsupporttechniker\b",
+    r"\btechnicien(?:ne)?\s+support\b",
+    r"\bhelp\s*desk\b",
+    r"\bservice\s*desk\b",
+    r"\b(system|linux)\s+administrator\b",
+]
+
+
+def role_title_fallback_relevant(title: str) -> bool:
+    """
+    Recover obvious IT support/sysadmin titles that miss strict required-keyword patterns.
+    """
+    t = normalize(title or "")
+    if any(keyword_hit(t, kw, boundary_only=True) for kw in ROLE_TITLE_FALLBACK_KEYWORDS):
+        return True
+    return any(re.search(pattern, t) is not None for pattern in ROLE_TITLE_FALLBACK_PATTERNS)
+
+
+ROLE_FORBIDDEN_CONTEXT_SKIP = {"keycloak", "commercial", "delivery"}
+ROLE_DESC_SIGNAL_PREFIX_CHARS = 360
+FORBIDDEN_ROLE_SECTION_PATTERNS = [
+    r"\brole\b",
+    r"\bposition\b",
+    r"\bjob\s+title\b",
+    r"\bwe\s+are\s+looking\s+for\b",
+    r"\blooking\s+for\s+(?:a|an)\b",
+    r"\byour\s+role\b",
+    r"\bresponsibilities\b",
+    r"\byour\s+mission\b",
+    r"\bmission\b",
+]
+FORBIDDEN_STAKEHOLDER_PATTERNS = [
+    r"\bcollaborat\w*\s+with\b",
+    r"\bwork\w*\s+with\b",
+    r"\bteam\s+includes?\b",
+    r"\bteam\s+consists?\s+of\b",
+    r"\bstakeholders?\s+include\b",
+    r"\bin\s+collaboration\s+with\b",
+    r"\balongside\b",
+]
+DELIVERY_ROLE_PATTERNS = [
+    r"\bdelivery\s+(driver|courier|rider|agent)\b",
+    r"\bwarehouse\s+delivery\b",
+    r"\bcourier\b",
+    r"\blivreur\b",
+    r"\bchauffeur[-\s]?livreur\b",
+]
+COMMERCIAL_SALES_MARKERS = [
+    "sales",
+    "business development",
+    "account executive",
+    "account manager",
+    "inside sales",
+    "quota",
+    "prospect",
+    "pipeline",
+    "lead generation",
+    "cold call",
+]
+COMMERCIAL_FALSE_POSITIVE_MARKERS = [
+    "commercial sector",
+    "commercial vessels",
+    "commercial operations",
+]
+
+
+def _is_delivery_role(text_norm: str) -> bool:
+    return any(re.search(pattern, text_norm) for pattern in DELIVERY_ROLE_PATTERNS)
+
+
+def _is_commercial_sales_role(title_norm: str, text_norm: str) -> bool:
+    has_commercial = keyword_hit(title_norm, "commercial", boundary_only=True) or keyword_hit(
+        text_norm, "commercial", boundary_only=True
+    )
+    if not has_commercial:
+        return False
+    if any(marker in text_norm for marker in COMMERCIAL_FALSE_POSITIVE_MARKERS):
+        return False
+    return any(keyword_hit(text_norm, marker, boundary_only=True) for marker in COMMERCIAL_SALES_MARKERS)
+
+
+def forbidden_hit_in_desc(desc: str, bad: str) -> bool:
+    """
+    Return True only when a forbidden keyword appears in a high-signal role context in description:
+    - very early in the text (summary zone), or
+    - near role/position/responsibility cues.
+    Stakeholder contexts ("team includes", "work with", ...) are ignored.
+    """
+    desc_norm = normalize_text(desc or "")
+    bad_norm = normalize_text(bad or "").strip()
+    if not desc_norm or not bad_norm:
+        return False
+    if not keyword_hit(desc_norm, bad_norm, boundary_only=True):
+        return False
+
+    bad_pattern = r"(?<![a-z0-9])" + re.escape(bad_norm).replace(r"\ ", r"\s+") + r"(?![a-z0-9])"
+    for match in re.finditer(bad_pattern, desc_norm):
+        start = match.start()
+        end = match.end()
+        local_window = desc_norm[max(0, start - 90) : min(len(desc_norm), end + 120)]
+        if any(re.search(pattern, local_window) for pattern in FORBIDDEN_STAKEHOLDER_PATTERNS):
+            continue
+        if start <= ROLE_DESC_SIGNAL_PREFIX_CHARS:
+            return True
+        left_context = desc_norm[max(0, start - 160) : start]
+        if any(re.search(pattern, left_context) for pattern in FORBIDDEN_ROLE_SECTION_PATTERNS):
+            return True
+    return False
+
+
+def role_forbidden_reason(title: str, desc: str) -> str:
+    """
+    Return forbidden-role detail when text clearly matches out-of-target role.
+    Context-aware handling avoids tech false positives like Keycloak or service delivery wording.
+    """
+    text_norm = normalize_text(f"{title or ''} {desc or ''}")
+    title_norm = normalize_text(title or "")
 
     for bad in ROLE_FORBIDDEN_KEYWORDS:
-        if bad in text:
-            return False
+        bad_norm = normalize_text(bad or "").strip()
+        if not bad_norm or bad_norm in ROLE_FORBIDDEN_CONTEXT_SKIP:
+            continue
+        # Title hit is a high-confidence signal: block directly.
+        if keyword_hit(title_norm, bad_norm, boundary_only=True):
+            return bad_norm
+        # Description hit needs stronger contextual evidence to avoid stakeholder false positives.
+        if forbidden_hit_in_desc(desc, bad_norm):
+            return bad_norm
 
-    return any(good in text for good in ROLE_REQUIRED_KEYWORDS)
+    if _is_delivery_role(text_norm):
+        return "delivery_role"
+    if _is_commercial_sales_role(title_norm, text_norm):
+        return "commercial_sales"
+    return ""
+
+
+def role_relevant(title: str, desc: str) -> bool:
+    """Keep infra / cloud / devops roles, drop forbidden ones."""
+    text = normalize_text((title or "") + " " + (desc or ""))
+
+    if role_forbidden_reason(title, desc):
+        return False
+
+    if any(keyword_hit(text, good, boundary_only=True) for good in ROLE_REQUIRED_KEYWORDS):
+        return True
+
+    if ACTIVE_JOB_MODE == "speed":
+        if any(keyword_hit(text, kw, boundary_only=True) for kw in SPEED_ROLE_TARGETS):
+            return True
+
+    if training_program_relevant(title, desc):
+        return True
+
+    return role_title_fallback_relevant(title)
 
 
 def compute_junior_score(title: str, desc: str) -> int:
@@ -177,8 +1295,6 @@ def compute_junior_score(title: str, desc: str) -> int:
         "trainee",
         "training program",
         "traineeship",
-        "apprentice",
-        "apprenticeship",
         "alternance",
         "intern",
         "internship",
@@ -236,14 +1352,7 @@ def compute_junior_score(title: str, desc: str) -> int:
         "4 years",
         "4+ years",
         "3+ years",
-        "ability to mentor",
-        "mentor junior",
-        "coaching",
         "manage stakeholders",
-        "ownership",
-        "take ownership",
-        "autonomous",
-        "work autonomously",
         "end-to-end responsibility",
         "strategic",
         "strategic mindset",
@@ -257,26 +1366,194 @@ def compute_junior_score(title: str, desc: str) -> int:
     return score
 
 
+def compute_language_fit_score(title: str, desc: str) -> int:
+    """
+    Return language fit in [0..2]:
+      - 2: FR and/or EN explicitly required, NL/DE not required
+      - 1: requirement unclear, but text is EN/FR-friendly
+      - 0: NL/DE explicitly required (or Dutch/German-only wording)
+    """
+    text = f"{title or ''} {desc or ''}"
+    req = language_requirements(text)
+    required = set(req.get("required_langs", set()))
+
+    if required.intersection({"nl", "de"}):
+        return 0
+    if required.intersection({"fr", "en"}):
+        return 2
+
+    norm = normalize_text(text)
+    if re.search(r"\b(dutch|nederlands|german|deutsch)\s+only\b", norm):
+        return 0
+    has_fr_or_en_signal = bool(_extract_language_codes(norm).intersection({"fr", "en"}))
+    return 1 if has_fr_or_en_signal or bool(norm) else 0
+
+
+def compute_priority_score(
+    title: str,
+    desc: str,
+    loc: str,
+    created: str,
+    junior_score: int,
+    language_fit_score: int,
+) -> int:
+    """
+    Rank jobs by apply-first priority.
+    Higher means better fit for quick-entry hiring strategy.
+    """
+    text = normalize((title or "") + " " + (desc or ""))
+    loc_norm = normalize(loc or "")
+    score = 50 + max(0, junior_score) * 2 + language_fit_score * 2
+
+    for term, weight in ACTIVE_PRIORITY_TERMS.items():
+        if normalize(term) in text:
+            score += int(weight)
+
+    training_patterns = [
+        "junior",
+        "trainee",
+        "intern",
+        "internship",
+        "entry level",
+        "training provided",
+        "no experience required",
+        "graduate",
+    ]
+    for pat in training_patterns:
+        if pat in text:
+            score += 2
+
+    work_mode = detect_work_mode(title, desc, loc)
+    if work_mode == "remote":
+        score += 5
+    elif work_mode == "hybrid":
+        score += 3
+
+    if ACTIVE_MARKET == "ch":
+        romandie_terms = [
+            "geneve",
+            "geneva",
+            "lausanne",
+            "vaud",
+            "neuchatel",
+            "jura",
+            "fribourg",
+            "valais",
+            "sion",
+            "nyon",
+            "montreux",
+        ]
+        if any(term in loc_norm for term in romandie_terms):
+            score += 5
+
+    # Prefer fresher offers when deciding what to apply first.
+    try:
+        dt = datetime.fromisoformat(str(created).replace("Z", "+00:00")).astimezone(timezone.utc)
+        age_days = (datetime.now(timezone.utc) - dt).days
+        if age_days <= 3:
+            score += 8
+        elif age_days <= 7:
+            score += 6
+        elif age_days <= 14:
+            score += 4
+        elif age_days <= 30:
+            score += 2
+    except Exception:
+        pass
+
+    return int(score)
+
+
+def close_excel_for_locked_path(path: str) -> str:
+    """
+    Best-effort unlock for CSV writes on Windows.
+    1) Close the workbook matching `path` if Excel is running.
+    2) Optionally force-kill Excel as fallback.
+    Returns a short action code for logging.
+    """
+    if os.name != "nt":
+        return "unsupported_os"
+
+    target = os.path.abspath(path).replace("'", "''")
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        f"$target=[System.IO.Path]::GetFullPath('{target}');"
+        "$closed=$false;"
+        "try {"
+        "  $excel=[Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application');"
+        "  if($excel){"
+        "    foreach($wb in @($excel.Workbooks)){"
+        "      try {"
+        "        $wbPath=[System.IO.Path]::GetFullPath($wb.FullName);"
+        "        if($wbPath -ieq $target){$wb.Close($false);$closed=$true}"
+        "      } catch {}"
+        "    }"
+        "    if($closed -and $excel.Workbooks.Count -eq 0){$excel.Quit()}"
+        "  }"
+        "} catch {};"
+        "if($closed){'closed_target'} else {'not_closed'}"
+    )
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        out = (res.stdout or "").strip().lower()
+        if "closed_target" in out:
+            return "closed_target"
+    except Exception:
+        pass
+
+    if not FORCE_KILL_EXCEL_ON_LOCK:
+        return "not_closed"
+
+    try:
+        res = subprocess.run(
+            ["taskkill", "/IM", "EXCEL.EXE", "/F"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0:
+            return "killed_excel"
+    except Exception:
+        pass
+    return "not_closed"
+
+
 def safe_save_csv(df, path, retry_delay=3, max_retries=3):
     """Save CSV and retry if locked by Excel; fall back to .bak if still locked."""
     attempts = 0
     while attempts < max_retries:
         try:
-            df.to_csv(path, index=False)
+            df.to_csv(path, index=False, encoding="utf-8-sig")
             print(f"[INFO] Saved file: {path}")
             return
         except PermissionError:
             attempts += 1
-            print(f"[WARN] File {path} is open (attempt {attempts}/{max_retries}). Retrying in {retry_delay}s...")
+            unlocked = "disabled"
+            if AUTO_CLOSE_EXCEL_ON_LOCK:
+                unlocked = close_excel_for_locked_path(path)
+                if unlocked in {"closed_target", "killed_excel"}:
+                    print(f"[WARN] File {path} was locked. Auto-closed Excel ({unlocked}). Retrying write...")
+                    time.sleep(1)
+                    continue
+            print(
+                f"[WARN] File {path} is open (attempt {attempts}/{max_retries}, unlock={unlocked}). "
+                f"Retrying in {retry_delay}s..."
+            )
             time.sleep(retry_delay)
     # fallback
     backup = path + ".bak"
-    df.to_csv(backup, index=False)
+    df.to_csv(backup, index=False, encoding="utf-8-sig")
     print(f"[WARN] Could not write {path} after {max_retries} attempts. Saved to {backup} instead.")
 
 
-def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
+def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> dict | None:
     """Apply common filters and return normalized job if it passes."""
+    mode = resolve_filter_mode(filter_mode or ACTIVE_FILTER_MODE, allow_both=False)
     created = job.get("created", "") or job.get("updated", "")
 
     loc = job.get("location", "")
@@ -284,17 +1561,19 @@ def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
         loc = loc.get("display_name", "")
     if not loc:
         loc = job.get("location.display_name", "")
+    loc = rule_plain_text(loc)
 
-    title = job.get("title", "") or ""
-    desc = job.get("description", "") or ""
+    title = rule_plain_text(job.get("title", "") or "")
+    desc = rule_plain_text(job.get("description", "") or "")
     url = job.get("redirect_url", "") or job.get("url", "") or job.get("link", "")
-    canonical_url = url.split("?", 1)[0] if url else ""
+    canonical_url = canonicalize_url(url)
 
     company_val = job.get("company", "")
     if isinstance(company_val, dict):
         company = company_val.get("display_name", "") or company_val.get("name", "")
     else:
         company = company_val or job.get("company.display_name", "")
+    company = rule_plain_text(company)
 
     if REQUIRE_DESCRIPTION and len(desc.strip()) < MIN_DESCRIPTION_CHARS:
         return None
@@ -303,28 +1582,44 @@ def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
     if any(bt in norm_title for bt in BAD_TITLE_KEYWORDS):
         return None
 
-    full_text = f"{title} {desc}"
+    _rule_norm, full_text = job_text_for_rules({"title": title, "description": desc})
+    work_mode = detect_work_mode(title, desc, loc)
+    experience_level, experience_detail, years_required = detect_experience_requirement_details(title, desc)
 
     if not is_recent(created, MAX_DAYS_OLD):
         return None
 
-    if not location_ok(loc):
+    if not location_ok(loc, title, desc):
         return None
 
     if not role_relevant(title, desc):
         return None
 
-    if not no_excluded_keywords(full_text):
+    if is_internship_student_only(title, desc):
         return None
 
-    if is_dutch(full_text):
+    exclude_hard_hits, _exclude_soft_hits = classify_excluded_hits(title, full_text)
+    if exclude_hard_hits:
+        return None
+
+    if experience_level == "hard":
+        return None
+
+    blocked_language_reason = blocked_language_requirement_reason(full_text)
+    if blocked_language_reason:
+        return None
+
+    disallowed_language_detected = is_disallowed_language(full_text)
+    if mode == "strict" and disallowed_language_detected:
         return None
 
     # Autoriser les offres neutres (score >= 0) pour ne pas filtrer trop agressivement
     junior_score = compute_junior_score(title, desc)
-    # Exclure les annonces au score clairement négatif, garder neutre ou positif
-    if junior_score < 0:
+    # Exclure les annonces au score clairement nÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©gatif, garder neutre ou positif
+    min_junior_score = 0 if mode == "strict" else -1
+    if junior_score < min_junior_score:
         return None
+    language_fit_score = compute_language_fit_score(title, desc)
 
     return {
         "title": title,
@@ -338,6 +1633,142 @@ def passes_filters(job: dict, source: str = "adzuna") -> dict | None:
         "description": desc[:400],
         "search_term": job.get("search_term", ""),
         "junior_score": junior_score,
+        "language_fit_score": language_fit_score,
+        "priority_score": compute_priority_score(
+            title,
+            desc,
+            loc,
+            created,
+            junior_score,
+            language_fit_score,
+        ),
+        "is_remote": work_mode in {"remote", "hybrid"},
+        "work_mode": work_mode,
+        "years_required": years_required if years_required is not None else "",
+        "experience_level": experience_level,
+        "experience_detail": normalize_text(experience_detail) if experience_detail else "",
+        "blocked_language_reason": blocked_language_reason,
+        "disallowed_language_detected": disallowed_language_detected,
+        "filter_mode": mode,
+        "source": source,
+    }
+
+
+def build_filtered_df(all_jobs: list[dict], filter_mode: str, source: str = "adzuna") -> pd.DataFrame:
+    """Apply filtering + dedup + sorting for one filter mode."""
+    filtered = []
+    resolved_mode = resolve_filter_mode(filter_mode, allow_both=False)
+    for job in all_jobs:
+        parsed = passes_filters(job, source=source, filter_mode=resolved_mode)
+        if parsed:
+            filtered.append(parsed)
+
+    df_f = pd.DataFrame(filtered)
+    before = len(df_f)
+    if "canonical_url" not in df_f.columns:
+        if "url" in df_f.columns:
+            df_f["canonical_url"] = df_f["url"].fillna("").astype(str).apply(canonicalize_url)
+        else:
+            df_f["canonical_url"] = ""
+    if not df_f.empty:
+        df_f = df_f.drop_duplicates(subset=["canonical_url", "title", "company"])
+        sort_cols = [c for c in ["priority_score", "junior_score", "created"] if c in df_f.columns]
+        if sort_cols:
+            df_f = df_f.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
+    after = len(df_f)
+    print(f"[INFO] [{resolved_mode}] Duplicates removed: {before - after}")
+    print(f"[INFO] [{resolved_mode}] Filtered kept: {len(df_f)}")
+    return df_f
+
+
+def near_miss_location_only(job: dict, min_priority: int = 68, source: str = "adzuna") -> dict | None:
+    """
+    Return job if it fails only location filter but is otherwise a strong candidate.
+    Useful to manually review potentially relevant opportunities.
+    """
+    created = job.get("created", "") or job.get("updated", "")
+
+    loc = job.get("location", "")
+    if isinstance(loc, dict):
+        loc = loc.get("display_name", "")
+    if not loc:
+        loc = job.get("location.display_name", "")
+    loc = rule_plain_text(loc)
+
+    title = rule_plain_text(job.get("title", "") or "")
+    desc = rule_plain_text(job.get("description", "") or "")
+    url = job.get("redirect_url", "") or job.get("url", "") or job.get("link", "")
+    canonical_url = canonicalize_url(url)
+
+    company_val = job.get("company", "")
+    if isinstance(company_val, dict):
+        company = company_val.get("display_name", "") or company_val.get("name", "")
+    else:
+        company = company_val or job.get("company.display_name", "")
+    company = rule_plain_text(company)
+
+    if REQUIRE_DESCRIPTION and len(desc.strip()) < MIN_DESCRIPTION_CHARS:
+        return None
+
+    norm_title = normalize(title)
+    if any(bt in norm_title for bt in BAD_TITLE_KEYWORDS):
+        return None
+
+    _rule_norm, full_text = job_text_for_rules({"title": title, "description": desc})
+    work_mode = detect_work_mode(title, desc, loc)
+    experience_level, _experience_detail, years_required = detect_experience_requirement_details(title, desc)
+
+    if not is_recent(created, MAX_DAYS_OLD):
+        return None
+
+    # Must fail location to be considered a location-only near miss.
+    if location_ok(loc, title, desc):
+        return None
+
+    if not role_relevant(title, desc):
+        return None
+
+    if is_internship_student_only(title, desc):
+        return None
+
+    exclude_hard_hits, _exclude_soft_hits = classify_excluded_hits(title, full_text)
+    if exclude_hard_hits:
+        return None
+
+    if experience_level == "hard":
+        return None
+
+    if blocked_language_requirement_reason(full_text):
+        return None
+
+    if is_disallowed_language(full_text):
+        return None
+
+    junior_score = compute_junior_score(title, desc)
+    if junior_score < 0:
+        return None
+
+    language_fit_score = compute_language_fit_score(title, desc)
+    priority_score = compute_priority_score(title, desc, loc, created, junior_score, language_fit_score)
+    if priority_score < min_priority:
+        return None
+
+    return {
+        "title": title,
+        "company": company,
+        "location": loc,
+        "created": created,
+        "url": url,
+        "canonical_url": canonical_url,
+        "description": desc[:400],
+        "search_term": job.get("search_term", ""),
+        "junior_score": junior_score,
+        "language_fit_score": language_fit_score,
+        "priority_score": priority_score,
+        "is_remote": work_mode in {"remote", "hybrid"},
+        "work_mode": work_mode,
+        "years_required": years_required if years_required is not None else "",
+        "near_miss_reason": "location_only",
         "source": source,
     }
 
@@ -348,23 +1779,58 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--market",
+        choices=SUPPORTED_MARKETS,
+        default="",
+        help="Market mode (be|ch). Defaults to JOB_MARKET env var or be.",
+    )
+    parser.add_argument(
+        "--ch-focus",
+        choices=SUPPORTED_CH_FOCUS,
+        default="",
+        help="CH focus mode (all|romandie). Defaults to JOB_CH_FOCUS env var or all.",
+    )
+    parser.add_argument(
+        "--filter-mode",
+        choices=SUPPORTED_FILTER_MODES,
+        default="",
+        help="Filtering strictness (strict|broad|both). Defaults to JOB_FILTER_MODE env var or strict.",
+    )
+    parser.add_argument(
         "--no-fetch",
         action="store_true",
         help="Ne pas appeler l'API, utiliser uniquement le CSV brut existant",
     )
     args = parser.parse_args()
 
+    global ACTIVE_FILTER_MODE
+    configure_market(args.market, args.ch_focus)
+    selected_filter_mode = resolve_filter_mode(args.filter_mode, allow_both=True)
+    ACTIVE_FILTER_MODE = selected_filter_mode if selected_filter_mode != "both" else "strict"
+    adzuna_raw_csv = ACTIVE_OUTPUT_PATHS["adzuna_raw_csv"]
+    adzuna_filtered_csv = ACTIVE_OUTPUT_PATHS["adzuna_filtered_csv"]
+    adzuna_filtered_strict_csv = ACTIVE_OUTPUT_PATHS["adzuna_filtered_strict_csv"]
+    adzuna_filtered_broad_csv = ACTIVE_OUTPUT_PATHS["adzuna_filtered_broad_csv"]
+    near_miss_csv = ACTIVE_OUTPUT_PATHS["near_miss_csv"]
+    search_terms = list(SEARCH_TERMS)
+    print(
+        f"[INFO] Market={ACTIVE_MARKET} country={ACTIVE_MARKET_PROFILE['adzuna_country']} "
+        f"ch_focus={ACTIVE_MARKET_PROFILE['ch_focus']} "
+        f"langs={ACTIVE_MARKET_PROFILE['allowed_language_codes']} terms={len(search_terms)} "
+        f"filter_mode={selected_filter_mode}"
+    )
+
     all_jobs = []
 
     if args.no_fetch:
-        if not os.path.exists(ADZUNA_RAW_CSV):
-            print(f"[ERROR] Fichier brut introuvable: {ADZUNA_RAW_CSV}")
+        if not os.path.exists(adzuna_raw_csv):
+            print(f"[ERROR] Fichier brut introuvable: {adzuna_raw_csv}")
             return
         print("[INFO] Chargement du fichier brut existant...")
-        df_raw = pd.read_csv(ADZUNA_RAW_CSV)
+        df_raw = pd.read_csv(adzuna_raw_csv)
         all_jobs = df_raw.to_dict(orient="records")
     else:
-        for term in SEARCH_TERMS:
+        for term in search_terms:
             print(f"[INFO] Searching for: {term}")
             page_count = PAGES_PER_TERM.get(term, DEFAULT_PAGES)
 
@@ -384,27 +1850,49 @@ def main():
                 time.sleep(1)
 
         df_raw = pd.json_normalize(all_jobs)
-        safe_save_csv(df_raw, ADZUNA_RAW_CSV)
+        safe_save_csv(df_raw, adzuna_raw_csv)
         print(f"[INFO] Raw saved: {len(df_raw)}")
 
-    # Filtering
-    filtered = []
-    for job in all_jobs:
-        parsed = passes_filters(job, source="adzuna")
-        if parsed:
-            filtered.append(parsed)
+    if selected_filter_mode in ("strict", "both"):
+        df_strict = build_filtered_df(all_jobs, filter_mode="strict", source="adzuna")
+        safe_save_csv(df_strict, adzuna_filtered_strict_csv)
+        safe_save_csv(df_strict, adzuna_filtered_csv)
+        print(f"[INFO] Strict filtered saved: {len(df_strict)}")
+    else:
+        df_strict = None
 
-    df_f = pd.DataFrame(filtered)
-    before = len(df_f)
-    if "canonical_url" not in df_f.columns:
-        df_f["canonical_url"] = df_f["url"].str.split("?", n=1).str[0]
-    df_f = df_f.drop_duplicates(subset=["canonical_url", "title", "company"])
-    after = len(df_f)
-    print(f"[INFO] Duplicates removed: {before - after}")
+    if selected_filter_mode in ("broad", "both"):
+        df_broad = build_filtered_df(all_jobs, filter_mode="broad", source="adzuna")
+        safe_save_csv(df_broad, adzuna_filtered_broad_csv)
+        if selected_filter_mode == "broad":
+            safe_save_csv(df_broad, adzuna_filtered_csv)
+        print(f"[INFO] Broad filtered saved: {len(df_broad)}")
+    else:
+        df_broad = None
 
-    safe_save_csv(df_f, ADZUNA_FILTERED_CSV)
-    print(f"[INFO] Filtered saved: {len(df_f)}")
+    # Near misses remain strict-only signal (best for manual review).
+    if selected_filter_mode in ("strict", "both"):
+        near_miss = []
+        for job in all_jobs:
+            parsed = near_miss_location_only(job, min_priority=68, source="adzuna")
+            if parsed:
+                near_miss.append(parsed)
+
+        df_nm = pd.DataFrame(near_miss)
+        if not df_nm.empty:
+            if "canonical_url" not in df_nm.columns:
+                df_nm["canonical_url"] = df_nm["url"].fillna("").astype(str).str.split("?", n=1).str[0]
+            df_nm = df_nm.drop_duplicates(subset=["canonical_url", "title", "company"])
+            sort_cols_nm = [c for c in ["priority_score", "language_fit_score", "junior_score", "created"] if c in df_nm.columns]
+            if sort_cols_nm:
+                df_nm = df_nm.sort_values(by=sort_cols_nm, ascending=[False] * len(sort_cols_nm))
+        safe_save_csv(df_nm, near_miss_csv)
+        print(f"[INFO] Near-miss (location-only) saved: {len(df_nm)} -> {near_miss_csv}")
+    else:
+        print("[INFO] Near-miss skipped in broad mode (strict-only signal).")
 
 
 if __name__ == "__main__":
     main()
+
+

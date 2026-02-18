@@ -24,6 +24,84 @@ from config import SUPPORTED_CH_FOCUS, SUPPORTED_MARKETS, get_market_profile, ge
 
 
 CLOSED_STATUSES = {"applied", "interview", "offer", "rejected", "withdrawn", "not_interested"}
+POSITIVE_FEEDBACK_STATUSES = {"interview", "offer"}
+NEGATIVE_FEEDBACK_STATUSES = {"rejected", "not_interested", "withdrawn"}
+
+
+def _normalize_text_key(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _status_outcome_weight(status: str) -> int:
+    """
+    Lightweight outcome weighting from tracker statuses.
+    Positive outcomes (interview/offer) should boost similar jobs.
+    Negative outcomes should slightly demote similar jobs.
+    """
+    status_norm = _normalize_text_key(status)
+    if status_norm == "offer":
+        return 4
+    if status_norm == "interview":
+        return 3
+    if status_norm == "applied":
+        return 1
+    if status_norm == "rejected":
+        return -3
+    if status_norm in {"not_interested", "withdrawn"}:
+        return -2
+    return 0
+
+
+def build_feedback_maps(tracker_df: pd.DataFrame) -> tuple[dict[str, int], dict[str, int]]:
+    """
+    Build company/term feedback maps from historical outcomes.
+    Scores are capped to keep ranking stable.
+    """
+    if tracker_df.empty:
+        return {}, {}
+
+    by_company: dict[str, list[int]] = {}
+    by_term: dict[str, list[int]] = {}
+    for _, row in tracker_df.iterrows():
+        status = _normalize_text_key(row.get("status", ""))
+        weight = _status_outcome_weight(status)
+        if weight == 0:
+            continue
+
+        company_key = _normalize_text_key(row.get("company", ""))
+        term_key = _normalize_text_key(row.get("search_term", ""))
+
+        if company_key:
+            by_company.setdefault(company_key, []).append(weight)
+        if term_key:
+            by_term.setdefault(term_key, []).append(weight)
+
+    def aggregate(values: list[int]) -> int:
+        if not values:
+            return 0
+        # Use mean-like score and cap to avoid overpowering current relevance.
+        score = round(sum(values) / max(1, len(values)))
+        return int(max(-4, min(4, score)))
+
+    company_scores = {k: aggregate(v) for k, v in by_company.items() if v}
+    term_scores = {k: aggregate(v) for k, v in by_term.items() if v}
+    return company_scores, term_scores
+
+
+def compute_feedback_score(
+    row: pd.Series, company_scores: dict[str, int], term_scores: dict[str, int]
+) -> tuple[int, str]:
+    company_key = _normalize_text_key(row.get("company", ""))
+    term_key = _normalize_text_key(row.get("search_term", ""))
+    c_score = int(company_scores.get(company_key, 0))
+    t_score = int(term_scores.get(term_key, 0))
+    score = max(-6, min(6, c_score + t_score))
+    notes: list[str] = []
+    if c_score != 0 and company_key:
+        notes.append(f"company:{c_score}")
+    if t_score != 0 and term_key:
+        notes.append(f"term:{t_score}")
+    return score, " | ".join(notes)
 
 
 def make_job_id(canonical_url: str, title: str, company: str) -> str:
@@ -103,6 +181,12 @@ def build_reason(row: pd.Series, market_profile: dict) -> str:
     if market_profile.get("ch_focus") == "romandie" and "romandie" not in reasons:
         reasons.append("swiss-wide")
 
+    feedback_score = int(float(row.get("feedback_score", 0) or 0))
+    if feedback_score > 0:
+        reasons.append("historical-fit+")
+    elif feedback_score < 0:
+        reasons.append("historical-fit-")
+
     return ", ".join(reasons[:4]) if reasons else "priority-ranked"
 
 
@@ -181,6 +265,7 @@ def main():
     )
 
     tracker = safe_read_csv(tracker_csv)
+    company_feedback, term_feedback = build_feedback_maps(tracker)
     if not tracker.empty and "job_id" in tracker.columns:
         tracker = tracker.copy()
         if "status" not in tracker.columns:
@@ -198,17 +283,47 @@ def main():
     if not args.include_closed:
         jobs = jobs[~jobs["status"].isin(CLOSED_STATUSES)].copy()
 
+    # Apply a light feedback loop from historical outcomes.
+    feedback_pairs = jobs.apply(
+        lambda r: compute_feedback_score(r, company_feedback, term_feedback),
+        axis=1,
+    )
+    jobs["feedback_score"] = feedback_pairs.map(lambda x: x[0])
+    jobs["feedback_signals"] = feedback_pairs.map(lambda x: x[1])
+    if "hiring_likelihood_score" not in jobs.columns:
+        jobs["hiring_likelihood_score"] = 0
+    jobs["priority_score"] = pd.to_numeric(jobs["priority_score"], errors="coerce").fillna(0)
+    jobs["hiring_likelihood_score"] = pd.to_numeric(jobs["hiring_likelihood_score"], errors="coerce").fillna(0)
+    jobs["feedback_score"] = pd.to_numeric(jobs["feedback_score"], errors="coerce").fillna(0)
+    jobs["adjusted_priority_score"] = jobs["priority_score"] + jobs["feedback_score"]
+
     jobs["apply_reason"] = jobs.apply(lambda r: build_reason(r, market_profile), axis=1)
-    jobs["recommended_action"] = jobs["priority_score"].apply(
+    jobs["recommended_action"] = jobs["adjusted_priority_score"].apply(
         lambda s: "apply_now" if int(s) >= int(args.min_priority) else "review"
     )
 
-    sort_cols = [c for c in ["priority_score", "language_fit_score", "junior_score", "created"] if c in jobs.columns]
+    sort_cols = [
+        c
+        for c in [
+            "adjusted_priority_score",
+            "hiring_likelihood_score",
+            "feedback_score",
+            "priority_score",
+            "language_fit_score",
+            "junior_score",
+            "created",
+        ]
+        if c in jobs.columns
+    ]
     jobs = jobs.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
 
     keep_cols = [
         "job_id",
         "recommended_action",
+        "adjusted_priority_score",
+        "feedback_score",
+        "feedback_signals",
+        "hiring_likelihood_score",
         "priority_score",
         "language_fit_score",
         "junior_score",
@@ -237,7 +352,8 @@ def main():
 
     print(
         f"[QUEUE] Market={market} ch_focus={market_profile['ch_focus']} "
-        f"input={input_csv} rows={len(jobs)} -> queue={len(queue)} saved={output_csv}"
+        f"input={input_csv} rows={len(jobs)} -> queue={len(queue)} "
+        f"feedback(company={len(company_feedback)}, term={len(term_feedback)}) saved={output_csv}"
     )
 
 

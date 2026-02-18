@@ -11,13 +11,13 @@ import pandas as pd
 from pandas.errors import EmptyDataError
 from rapidfuzz import fuzz
 
-from adzuna_fetch import passes_filters, safe_save_csv
+from adzuna_fetch import configure_market, passes_filters, safe_save_csv
 from config import (
-    ADZUNA_RAW_CSV,
-    JOOBLE_RAW_CSV,
-    MERGED_CSV,
-    MERGED_FILTERED_CSV,
-    MERGED_RAW_CSV,
+    SUPPORTED_CH_FOCUS,
+    SUPPORTED_FILTER_MODES,
+    SUPPORTED_MARKETS,
+    get_output_paths,
+    resolve_filter_mode,
 )
 
 
@@ -215,8 +215,46 @@ def map_jooble_row(row: Dict) -> Dict:
 
 
 def main():
-    adzuna_raw = load_raw_jobs(ADZUNA_RAW_CSV, "Adzuna")
-    jooble_raw = load_raw_jobs(JOOBLE_RAW_CSV, "Jooble")
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--market",
+        choices=SUPPORTED_MARKETS,
+        default="",
+        help="Market mode (be|ch). Defaults to JOB_MARKET env var or be.",
+    )
+    parser.add_argument(
+        "--ch-focus",
+        choices=SUPPORTED_CH_FOCUS,
+        default="",
+        help="CH focus mode (all|romandie). Defaults to JOB_CH_FOCUS env var or all.",
+    )
+    parser.add_argument(
+        "--filter-mode",
+        choices=SUPPORTED_FILTER_MODES,
+        default="",
+        help="Filtering strictness (strict|broad|both). Defaults to JOB_FILTER_MODE env var or strict.",
+    )
+    args = parser.parse_args()
+
+    market = configure_market(args.market, args.ch_focus)
+    selected_filter_mode = resolve_filter_mode(args.filter_mode, allow_both=True)
+    output_paths = get_output_paths(market)
+    adzuna_raw_csv = output_paths["adzuna_raw_csv"]
+    jooble_raw_csv = output_paths["jooble_raw_csv"]
+    merged_raw_csv = output_paths["merged_raw_csv"]
+    merged_filtered_csv = output_paths["merged_filtered_csv"]
+    merged_filtered_strict_csv = output_paths["merged_filtered_strict_csv"]
+    merged_filtered_broad_csv = output_paths["merged_filtered_broad_csv"]
+    merged_csv = output_paths["merged_csv"]
+    print(
+        f"[MERGE] Market={market} ch_focus={args.ch_focus or 'default'} "
+        f"filter_mode={selected_filter_mode}"
+    )
+
+    adzuna_raw = load_raw_jobs(adzuna_raw_csv, "Adzuna")
+    jooble_raw = load_raw_jobs(jooble_raw_csv, "Jooble")
 
     if not adzuna_raw and not jooble_raw:
         print("[MERGE] Nothing to merge.")
@@ -225,7 +263,7 @@ def main():
     normalized = [map_adzuna_row(r) for r in adzuna_raw] + [map_jooble_row(r) for r in jooble_raw]
 
     # Save merged raw (normalized)
-    safe_save_csv(pd.DataFrame(normalized), MERGED_RAW_CSV)
+    safe_save_csv(pd.DataFrame(normalized), merged_raw_csv)
 
     # Dedup levels
     lvl1 = dedup_by_url(normalized)
@@ -233,18 +271,30 @@ def main():
     lvl3 = fuzzy_dedup(lvl2)
     print(f"[MERGE] Dedup level1 -> {len(lvl1)}, level2 -> {len(lvl2)}, level3 -> {len(lvl3)}")
 
-    # Final filtering
-    filtered = []
-    for job in lvl3:
-        parsed = passes_filters(job, source=job.get("source", "merged"))
-        if parsed:
-            filtered.append(parsed)
+    def run_filter(mode: str) -> pd.DataFrame:
+        kept = []
+        for job in lvl3:
+            parsed = passes_filters(job, source=job.get("source", "merged"), filter_mode=mode)
+            if parsed:
+                kept.append(parsed)
+        return pd.DataFrame(kept)
 
-    df_filtered = pd.DataFrame(filtered)
-    safe_save_csv(df_filtered, MERGED_FILTERED_CSV)
-    safe_save_csv(df_filtered, MERGED_CSV)  # legacy path
+    if selected_filter_mode in ("strict", "both"):
+        df_strict = run_filter("strict")
+        safe_save_csv(df_strict, merged_filtered_strict_csv)
+        safe_save_csv(df_strict, merged_filtered_csv)
+        safe_save_csv(df_strict, merged_csv)  # legacy path
+        print(f"[MERGE] Strict filtered: {len(df_strict)}")
 
-    print(f"[MERGE] Raw merged: {len(normalized)} rows -> final filtered: {len(df_filtered)}")
+    if selected_filter_mode in ("broad", "both"):
+        df_broad = run_filter("broad")
+        safe_save_csv(df_broad, merged_filtered_broad_csv)
+        if selected_filter_mode == "broad":
+            safe_save_csv(df_broad, merged_filtered_csv)
+            safe_save_csv(df_broad, merged_csv)  # legacy path
+        print(f"[MERGE] Broad filtered: {len(df_broad)}")
+
+    print(f"[MERGE] Raw merged: {len(normalized)} rows")
 
 
 if __name__ == "__main__":

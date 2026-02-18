@@ -84,6 +84,20 @@ EXCLUDE_EXCEPTIONS = [
     "hardware and peripherals",
 ]
 
+# Leadership/seniority words that should only hard-block when present in title.
+TITLE_ONLY_EXCLUDE = {
+    "manager",
+    "lead",
+    "director",
+    "head",
+    "head of",
+    "principal",
+    "expert",
+    "architect",
+    "team lead",
+    "tech lead",
+}
+
 ACTIVE_MARKET = ""
 ACTIVE_CH_FOCUS = "all"
 ACTIVE_FILTER_MODE = DEFAULT_FILTER_MODE
@@ -312,6 +326,23 @@ def keyword_hit(text: str, keyword: str, boundary_only: bool = True) -> bool:
     return kw in txt
 
 
+def keyword_match(text: str, kw: str) -> bool:
+    """
+    Match a keyword with safer semantics for exclude keyword checks:
+    - Multi-word / non-word keywords => case-insensitive substring.
+    - Single token keywords => whole-word regex match.
+    """
+    txt_norm = normalize_text(text or "")
+    kw_norm = normalize_text(kw or "").strip()
+    if not txt_norm or not kw_norm:
+        return False
+
+    if " " in kw_norm or re.search(r"\W", kw_norm):
+        return kw_norm in txt_norm
+
+    return re.search(rf"\b{re.escape(kw_norm)}\b", txt_norm, flags=re.IGNORECASE) is not None
+
+
 def extract_adzuna_job_id(url: str) -> str:
     """Extract numeric job id from Adzuna details/land URLs."""
     if not url:
@@ -469,19 +500,32 @@ def location_ok(loc: str, title: str = "", desc: str = "") -> bool:
     return any(normalize(kw) in norm_loc for kw in keywords)
 
 
-def excluded_hits(text: str) -> list[str]:
-    """Return list of excluded keywords, ignoring benign senior/lead contexts."""
-    norm = normalize(text)
+def _strip_exclude_exceptions(text: str) -> str:
+    """Remove benign phrases before exclude-keyword matching."""
+    norm = normalize_text(text or "")
     norm_padded = f" {norm} "
     for exc in EXCLUDE_EXCEPTIONS:
-        exc_norm = normalize(exc)
+        exc_norm = normalize_text(exc)
+        if not exc_norm:
+            continue
         norm_padded = norm_padded.replace(f" {exc_norm} ", " ")
         norm_padded = norm_padded.replace(exc_norm, " ")
+    return re.sub(r"\s+", " ", norm_padded).strip()
+
+
+def keyword_hits(text: str, keywords: list[str]) -> list[str]:
+    """Return all matching keywords (order preserved) after exception cleanup."""
+    filtered_text = _strip_exclude_exceptions(text)
     hits = []
-    for kw in EXCLUDE_KEYWORDS:
-        if keyword_hit(norm_padded, kw, boundary_only=True):
+    for kw in keywords:
+        if keyword_match(filtered_text, kw):
             hits.append(kw)
     return hits
+
+
+def excluded_hits(text: str) -> list[str]:
+    """Return list of excluded keywords, ignoring configured exception phrases."""
+    return keyword_hits(text, EXCLUDE_KEYWORDS)
 
 
 def no_excluded_keywords(text: str) -> bool:
@@ -517,13 +561,167 @@ def classify_excluded_hits(title: str, text: str) -> tuple[list[str], list[str]]
 
     hard_hits: list[str] = []
     soft_hits: list[str] = []
-    title_is_lead = title_has_lead_or_manager(title)
     for hit in hits:
-        if normalize_text(hit) == "lead" and not title_is_lead:
-            soft_hits.append("lead_soft")
+        if normalize_text(hit) in TITLE_ONLY_EXCLUDE and not keyword_match(title, hit):
+            soft_hits.append(hit)
         else:
             hard_hits.append(hit)
     return hard_hits, soft_hits
+
+
+def run_exclude_keyword_self_tests():
+    """Quick local checks for exclude-keyword false-positive reductions."""
+    print("[SELFTEST] Exclude keyword matching")
+
+    title_1 = "Operations Graduate Program - Platform Trainee"
+    desc_1 = "You will be supported by a manager during onboarding."
+    hard_1, soft_1 = classify_excluded_hits(title_1, f"{title_1} {desc_1}")
+    pass_1 = ("manager" not in [normalize_text(h) for h in hard_1]) and (
+        "manager" in [normalize_text(s) for s in soft_1] or not keyword_match(desc_1, "manager")
+    )
+    print(
+        f"[SELFTEST] manager in description only => hard={hard_1} soft={soft_1} "
+        f"expected=no hard manager | {'PASS' if pass_1 else 'FAIL'}"
+    )
+
+    title_2 = "IT Manager"
+    hard_2, soft_2 = classify_excluded_hits(title_2, title_2)
+    pass_2 = "manager" in [normalize_text(h) for h in hard_2]
+    print(
+        f"[SELFTEST] manager in title => hard={hard_2} soft={soft_2} "
+        f"expected=hard manager | {'PASS' if pass_2 else 'FAIL'}"
+    )
+
+    title_3 = "Cloud Architect"
+    hard_3, soft_3 = classify_excluded_hits(title_3, title_3)
+    pass_3 = "architect" in [normalize_text(h) for h in hard_3]
+    print(
+        f"[SELFTEST] architect in title => hard={hard_3} soft={soft_3} "
+        f"expected=hard architect | {'PASS' if pass_3 else 'FAIL'}"
+    )
+
+    desc_4 = "You will own cloud architecture and platform patterns."
+    hard_4, soft_4 = classify_excluded_hits("Cloud Engineer", desc_4)
+    pass_4 = "architect" not in [normalize_text(x) for x in (hard_4 + soft_4)]
+    print(
+        f"[SELFTEST] architecture vs architect => hard={hard_4} soft={soft_4} "
+        f"expected=no architect hit | {'PASS' if pass_4 else 'FAIL'}"
+    )
+
+
+def run_self_checks():
+    """
+    Minimal executable self-checks for language and experience policy.
+    Designed for quick local validation without external test frameworks.
+    """
+    print("[SELFCHECK] Running language/experience checks...")
+    passed = 0
+    total = 0
+
+    def check(label: str, condition: bool, details: str = ""):
+        nonlocal passed, total
+        total += 1
+        ok = bool(condition)
+        if ok:
+            passed += 1
+        suffix = f" | {details}" if details else ""
+        print(f"[SELFCHECK] {label}: {'PASS' if ok else 'FAIL'}{suffix}")
+
+    # 1) Dutch as plus/asset should NOT be mandatory.
+    case_1 = "English required. Dutch is a plus."
+    need_1 = classify_language_need(case_1)
+    check(
+        "Dutch plus => preferred not required",
+        need_1["prefers_dutch"] and not need_1["requires_dutch"],
+        f"signals={need_1.get('signals', [])}",
+    )
+
+    # 2) Dutch mandatory should stay blocked.
+    case_2 = "Fluent Dutch required for this role."
+    need_2 = classify_language_need(case_2)
+    check(
+        "Dutch mandatory => required",
+        need_2["requires_dutch"] and blocked_language_requirement_reason(case_2, "strict") != "",
+    )
+
+    # 3) Dutch mandatory in Dutch.
+    case_3 = "Nederlands verplicht. Frans is een plus."
+    need_3 = classify_language_need(case_3)
+    check(
+        "Nederlands verplicht => required",
+        need_3["requires_dutch"] and blocked_language_requirement_reason(case_3, "strict") != "",
+    )
+
+    # 4) FR or Dutch should be acceptable without Dutch.
+    case_4 = "French or Dutch required. English is a plus."
+    need_4 = classify_language_need(case_4)
+    check(
+        "French or Dutch => acceptable alternative",
+        need_4["acceptable_without_dutch"] and blocked_language_requirement_reason(case_4, "strict") == "",
+    )
+
+    # 5) FR/NL short notation should be acceptable.
+    case_5 = "Languages: FR/NL. English appreciated."
+    need_5 = classify_language_need(case_5)
+    check(
+        "FR/NL => acceptable alternative",
+        need_5["acceptable_without_dutch"] and not need_5["requires_dutch"],
+    )
+
+    # 6) Explicit bilingual requirement remains blocked.
+    case_6 = "Fluent in French and Dutch required."
+    need_6 = classify_language_need(case_6)
+    check(
+        "French and Dutch required => blocked",
+        need_6["requires_dutch"] and blocked_language_requirement_reason(case_6, "strict") != "",
+    )
+
+    # 7) English-only remains acceptable.
+    case_7 = "English only. Distributed team."
+    need_7 = classify_language_need(case_7)
+    check(
+        "English only => not blocked",
+        need_7["english_only"] and blocked_language_requirement_reason(case_7, "strict") == "",
+    )
+
+    # 8) 2-3 years + junior should not hard block.
+    title_8 = "Junior Cloud Engineer"
+    desc_8 = "2-3 years experience in Linux and cloud. Training provided."
+    lvl_8, detail_8, years_8 = detect_experience_requirement_details(title_8, desc_8)
+    check(
+        "2-3 years + junior => manual/soft",
+        lvl_8 in {"soft", "soft_junior_title"} and lvl_8 != "hard",
+        f"level={lvl_8} detail={detail_8} years={years_8}",
+    )
+
+    # 9) 3+ years + trainee signals should not hard block.
+    title_9 = "Platform Trainee"
+    desc_9 = "3+ years experience preferred. We hire for potential and will be trained."
+    lvl_9, detail_9, years_9 = detect_experience_requirement_details(title_9, desc_9)
+    check(
+        "3+ years + trainee signals => no hard block",
+        lvl_9 in {"soft", "soft_junior_title"},
+        f"level={lvl_9} detail={detail_9} years={years_9}",
+    )
+    check(
+        "3+ years + trainee => conflict reason kept",
+        "years_required_conflict_but_junior_signals" in normalize_text(detail_9),
+        f"detail={detail_9}",
+    )
+
+    # 10) 5+ years stays hard block.
+    title_10 = "Junior DevOps Engineer"
+    desc_10 = "Minimum 5 years of experience required."
+    lvl_10, detail_10, years_10 = detect_experience_requirement_details(title_10, desc_10)
+    check(
+        "5+ years => hard block",
+        lvl_10 == "hard",
+        f"level={lvl_10} detail={detail_10} years={years_10}",
+    )
+
+    # Keep previous keyword-specific checks.
+    run_exclude_keyword_self_tests()
+    print(f"[SELFCHECK] Summary: {passed}/{total} checks passed")
 
 
 LANGUAGE_TERMS = {
@@ -543,10 +741,14 @@ LANGUAGE_REQUIRED_PATTERNS = {
         r"\bexcellent\s+command\s+of\s+dutch\b",
         r"\bnative\s+dutch\b",
         r"\bbilingual\s+dutch\b",
+        r"\btweetalig(?:\s+\w+){0,3}\s+\bnl\b",
+        r"\bc1\s+dutch\s+required\b",
         r"\bnederlands\s+vereist\b",
         r"\bnederlands\s+is\s+verplicht\b",
         r"\bnederlands\s+verplicht\b",
         r"\bmoet\s+nederlands\s+spreken\b",
+        r"\bneerlandais\s+obligatoire\b",
+        r"\bneerlandais\s+requis\b",
         r"\bgoede\s+kennis\s+(?:van\s+)?nederlands\s+is\s+vereist\b",
         r"\bbonne\s+maitrise\s+du\s+neerlandais\b",
         r"\bbonne\s+maitrise\s+du\s+francais\s+et\s+du\s+neerlandais\b",
@@ -569,38 +771,74 @@ LANGUAGE_REQUIRED_PATTERNS = {
 LANGUAGE_OPTIONAL_PATTERNS = {
     "nl": [
         r"\bdutch\s+is\s+a\s+plus\b",
+        r"\bdutch\s+would\s+be\s+a\s+plus\b",
         r"\bnice\s+to\s+have\s+dutch\b",
+        r"\bdutch\s+is\s+a\s+nice\s+to\s+have\b",
         r"\bdutch\s+is\s+an\s+asset\b",
+        r"\bdutch\s+is\s+a\s+strong\s+asset\b",
+        r"\bknowledge\s+of\s+dutch\s+is\s+a\s+plus\b",
         r"\bnederlands\s+is\s+een\s+plus\b",
         r"\bkennis\s+van\s+nederlands\s+is\s+een\s+plus\b",
+        r"\bneerlandais\s+est\s+un\s+atout\b",
         r"\bneerlandais\s+(?:est|serait)\s+un\s+plus\b",
+        r"\ble\s+neerlandais\s+est\s+un\s+plus\b",
+        r"\ble\s+neerlandais\s+est\s+un\s+atout\b",
+        r"\bneerlandais\s+souhaite\b",
+        r"\bneerlandais\s+apprecie\b",
+        r"\ble\s+neerlandais\s+serait\s+apprecie\b",
+        r"\bdutch\s+is\s+a\s+bonus\b",
     ]
 }
 
 LANGUAGE_REQUIRED_CUE_RE = re.compile(
     r"\b(required|mandatory|must\s+speak|must\s+have|obligatoire|obligatoirement|requis|requise|"
-    r"verplicht|vereist|fluent|native|excellent\s+command|strong\s+command|good\s+command|"
-    r"very\s+good\s+knowledge|good\s+knowledge|bonne\s+maitrise|maitrise|goede\s+kennis)\b"
+    r"verplicht|vereist|necessary|necessaire|indispensable|exige|exigee|fluent|native|c1|c2|"
+    r"excellent\s+command|strong\s+command|very\s+good\s+knowledge|bonne\s+maitrise|maitrise)\b"
 )
-LANGUAGE_OPTIONAL_CUE_RE = re.compile(r"\b(plus|nice\s+to\s+have|asset|serait\s+un\s+plus|est\s+un\s+plus)\b")
+LANGUAGE_OPTIONAL_CUE_RE = re.compile(
+    r"\b(plus|nice\s+to\s+have|asset|atout|bonus|souhaite|apprecie|"
+    r"serait\s+apprecie|serait\s+un\s+plus|est\s+un\s+plus|est\s+un\s+atout)\b"
+)
 LANGUAGE_ALTERNATIVE_RE = re.compile(r"\b(or|ou|of)\b")
 LANGUAGE_TRILINGUAL_RE = re.compile(r"\b(trilingual|trilingue|drie(?:talig|talige))\b")
 LANGUAGE_ALT_PAIR_RE = re.compile(
-    r"\b(?:french|francais|english|anglais|dutch|nederlands|neerlandais|german|deutsch|allemand)\b\s*"
+    r"\b(?:french|francais|fr|english|anglais|en|dutch|nederlands|neerlandais|nl|german|deutsch|allemand)\b\s*"
     r"(?:/|or|ou|of)\s*"
-    r"\b(?:french|francais|english|anglais|dutch|nederlands|neerlandais|german|deutsch|allemand)\b"
+    r"\b(?:french|francais|fr|english|anglais|en|dutch|nederlands|neerlandais|nl|german|deutsch|allemand)\b"
 )
 ACCEPTABLE_FR_NL_ALTERNATIVE_PATTERNS = [
     r"\bdutch\s+or\s+french\b",
     r"\bfrench\s+or\s+dutch\b",
     r"\bdutch\s*/\s*french\b",
     r"\bfrench\s*/\s*dutch\b",
+    r"\bfr\s*/\s*nl\b",
+    r"\bnl\s*/\s*fr\b",
+    r"\bfr\s+or\s+nl\b",
+    r"\bnl\s+or\s+fr\b",
     r"\bat\s+least\s+one\s+of\s+(?:french|dutch)\s*(?:/|or)\s*(?:french|dutch)\b",
 ]
-BLOCKED_LANGUAGE_TERM_THEN_REQUIREMENT_RE = re.compile(
-    r"\b(dutch|nederlands|neerlandais|german|deutsch|allemand)\b.{0,24}"
-    r"\b(required|mandatory|must|obligatoire|verplicht|vereist|fluent|native)\b"
-)
+
+# Contextual mandatory matching: block only when language + mandatory cues co-occur
+# within a short window. This avoids false positives from simple keyword presence.
+BLOCKED_LANGUAGE_CONTEXT_PATTERNS = [
+    re.compile(
+        r"\b(?:dutch|nederlands|neerlandais|german|deutsch|allemand)\b(?:\W+\w+){0,5}\W+"
+        r"\b(?:required|mandatory|must|obligatoire|verplicht|vereist|necessary|indispensable|"
+        r"fluent|native|c1|c2|exige|exigee)\b"
+    ),
+    re.compile(
+        r"\b(?:required|mandatory|must|obligatoire|verplicht|vereist|necessary|indispensable|"
+        r"fluent|native|c1|c2|exige|exigee)\b(?:\W+\w+){0,5}\W+"
+        r"\b(?:dutch|nederlands|neerlandais|german|deutsch|allemand)\b"
+    ),
+]
+
+ENGLISH_ONLY_PATTERNS = [
+    r"\benglish\s+only\b",
+    r"\bonly\s+english\b",
+    r"\benglish\s+required\b",
+    r"\brequired\s+english\b",
+]
 
 
 def _extract_language_codes(text_norm: str) -> set[str]:
@@ -620,18 +858,14 @@ def _snippet(text_norm: str, max_len: int = 140) -> str:
     return value[: max_len - 3].rstrip() + "..."
 
 
-def language_requirements(text: str) -> dict:
+def _parse_language_signals(norm: str) -> dict:
     """
-    Parse explicit language requirements from normalized text.
-    Returns:
-      {
-        "required_langs": set[str],
-        "optional_langs": set[str],
-        "evidence": list[str],
-        "alternative_language_option": bool,
-      }
+    Parse language requirements/preferences from normalized text.
+    This parser is intentionally contextual:
+    - optional wording (plus/asset/atout/bonus) overrides generic requirement cues
+    - OR pairs (French or Dutch, FR/NL, ...) are treated as alternatives, not mandatory Dutch
+    - explicit mandatory patterns still hard-mark requirements
     """
-    norm = normalize_text(text or "")
     required_langs: set[str] = set()
     optional_langs: set[str] = set()
     evidence: list[str] = []
@@ -653,21 +887,34 @@ def language_requirements(text: str) -> dict:
         if not langs:
             continue
 
+        explicit_optional_langs: set[str] = set()
         optional_hit = LANGUAGE_OPTIONAL_CUE_RE.search(clause) is not None
         for code, patterns in LANGUAGE_OPTIONAL_PATTERNS.items():
             if any(re.search(pat, clause) for pat in patterns):
                 optional_hit = True
                 if code in langs:
-                    optional_langs.add(code)
+                    explicit_optional_langs.add(code)
+        if explicit_optional_langs:
+            optional_langs.update(explicit_optional_langs)
 
-        required_hit = LANGUAGE_REQUIRED_CUE_RE.search(clause) is not None
+        explicit_required_langs: set[str] = set()
         for code, patterns in LANGUAGE_REQUIRED_PATTERNS.items():
             if any(re.search(pat, clause) for pat in patterns):
-                required_hit = True
                 if code in langs:
-                    required_langs.add(code)
+                    explicit_required_langs.add(code)
 
-        # Ex: "English and Dutch (mandatory speaking)"
+        # Generic cue can mark required only when we do not have a pure optional clause.
+        required_hit = LANGUAGE_REQUIRED_CUE_RE.search(clause) is not None
+        if optional_hit and not explicit_required_langs:
+            required_hit = False
+
+        # Context windows for blocked languages (Dutch/German) with mandatory wording.
+        if any(pattern.search(clause) for pattern in BLOCKED_LANGUAGE_CONTEXT_PATTERNS):
+            if any(code in langs for code in {"nl", "de"}):
+                explicit_required_langs.update({code for code in langs if code in {"nl", "de"}})
+                required_hit = True
+
+        # Ex: "English and Dutch (mandatory speaking)" -> both required.
         and_combo = len(langs) >= 2 and re.search(r"\b(and|et|en|&)\b", clause)
         if and_combo and required_hit:
             required_langs.update(langs)
@@ -677,13 +924,19 @@ def language_requirements(text: str) -> dict:
             required_langs.update(langs)
             required_hit = True
 
+        # Ex: "French or Dutch" / "FR/NL": alternative path (not hard Dutch requirement).
         alternative = len(langs) >= 2 and LANGUAGE_ALT_PAIR_RE.search(clause) is not None
         if alternative:
             alternative_language_option = True
             alternative_langs.update(langs)
             if _snippet(clause) not in evidence:
                 evidence.append(_snippet(clause))
-            # "French or Dutch" is an alternative, not a hard requirement for Dutch.
+            continue
+
+        if explicit_required_langs:
+            required_langs.update(explicit_required_langs)
+            if _snippet(clause) not in evidence:
+                evidence.append(_snippet(clause))
             continue
 
         if optional_hit and not required_hit:
@@ -706,15 +959,98 @@ def language_requirements(text: str) -> dict:
     }
 
 
-def blocked_language_requirement_reason(text: str) -> str:
-    # "Dutch or French" is acceptable for this profile (French available).
-    if has_acceptable_language_alternative(text):
+def language_requirements(text: str) -> dict:
+    """
+    Backward-compatible language parser used by enrichment/reporting.
+    The richer policy (required vs preferred vs acceptable alternatives)
+    is implemented in classify_language_need().
+    Returns:
+      {
+        "required_langs": set[str],
+        "optional_langs": set[str],
+        "evidence": list[str],
+        "alternative_language_option": bool,
+      }
+    """
+    norm = normalize_text(text or "")
+    return _parse_language_signals(norm)
+
+
+def classify_language_need(text: str) -> dict:
+    """
+    Classify language need for job filtering/scoring.
+    Returns:
+      {
+        "requires_dutch": bool,
+        "prefers_dutch": bool,
+        "acceptable_without_dutch": bool,
+        "requires_blocked_language": bool,
+        "blocked_required_langs": list[str],
+        "required_langs": set[str],
+        "optional_langs": set[str],
+        "signals": list[str],
+        "english_only": bool,
+      }
+    """
+    norm = normalize_text(text or "")
+    parsed = _parse_language_signals(norm)
+    required = set(parsed.get("required_langs", set()))
+    optional = set(parsed.get("optional_langs", set()))
+    alternative_langs = set(parsed.get("alternative_langs", set()))
+    blocked_codes = set(ACTIVE_MARKET_PROFILE.get("blocked_language_codes", []))
+
+    requires_dutch = "nl" in required
+    prefers_dutch = ("nl" in optional) and not requires_dutch
+
+    # FR/NL alternatives are acceptable for this profile because French is available.
+    acceptable_without_dutch = False
+    if parsed.get("alternative_language_option") and {"fr", "nl"}.issubset(alternative_langs):
+        acceptable_without_dutch = True
+    if any(re.search(pattern, norm) for pattern in ACCEPTABLE_FR_NL_ALTERNATIVE_PATTERNS):
+        acceptable_without_dutch = True
+
+    # Explicit NL required overrides alternative wording.
+    if requires_dutch:
+        acceptable_without_dutch = False
+
+    english_only = any(re.search(pattern, norm) for pattern in ENGLISH_ONLY_PATTERNS)
+    blocked_required = sorted(required.intersection(blocked_codes))
+    requires_blocked_language = len(blocked_required) > 0 and not acceptable_without_dutch
+
+    signals = list(parsed.get("evidence", []))
+    if prefers_dutch:
+        signals.append("dutch_preferred_not_required")
+    if acceptable_without_dutch:
+        signals.append("fr_or_nl_alternative")
+    if english_only and not requires_dutch:
+        signals.append("english_only_or_english_required")
+    if requires_dutch:
+        signals.append("dutch_explicitly_required")
+
+    return {
+        "requires_dutch": requires_dutch,
+        "prefers_dutch": prefers_dutch,
+        "acceptable_without_dutch": acceptable_without_dutch,
+        "requires_blocked_language": requires_blocked_language,
+        "blocked_required_langs": blocked_required,
+        "required_langs": required,
+        "optional_langs": optional,
+        "signals": signals[:8],
+        "english_only": english_only,
+        "alternative_language_option": bool(parsed.get("alternative_language_option")),
+        "alternative_langs": alternative_langs,
+    }
+
+
+def blocked_language_requirement_reason(text: str, filter_mode: str = "strict") -> str:
+    need = classify_language_need(text)
+
+    # In broad mode we keep those rows and rely on downstream flags/manual checks.
+    mode = resolve_filter_mode(filter_mode, allow_both=False) if filter_mode else "strict"
+    if mode == "broad":
         return ""
 
-    req = language_requirements(text)
-    required = set(req.get("required_langs", set()))
-    blocked_codes = set(ACTIVE_MARKET_PROFILE.get("blocked_language_codes", []))
-    blocked_required = required.intersection(blocked_codes)
+    blocked_required = set(need.get("blocked_required_langs", []))
     if not blocked_required:
         return ""
     if "nl" in blocked_required:
@@ -726,12 +1062,9 @@ def blocked_language_requirement_reason(text: str) -> str:
 
 
 def language_manual_review_reason(text: str) -> str:
-    if has_acceptable_language_alternative(text):
-        return ""
-
-    req = language_requirements(text)
-    alt_langs = set(req.get("alternative_langs", set()))
-    if req.get("alternative_language_option") and alt_langs.intersection({"nl", "de"}):
+    need = classify_language_need(text)
+    alt_langs = set(need.get("alternative_langs", set()))
+    if need.get("alternative_language_option") and alt_langs.intersection({"nl", "de"}):
         if alt_langs.intersection({"fr"}):
             return ""
         return "language_alternative:blocked_language_option"
@@ -748,26 +1081,7 @@ def has_acceptable_language_alternative(text: str) -> bool:
     Return True when the ad offers an FR/NL alternative (acceptable for this profile),
     as long as Dutch/German is not explicitly marked mandatory elsewhere.
     """
-    norm = normalize_text(text or "")
-    if not norm:
-        return False
-
-    has_alt = any(re.search(pattern, norm) for pattern in ACCEPTABLE_FR_NL_ALTERNATIVE_PATTERNS)
-    if not has_alt:
-        return False
-
-    # Trilingual profiles are explicit multi-language requirements, not alternatives.
-    if LANGUAGE_TRILINGUAL_RE.search(norm):
-        return False
-
-    if BLOCKED_LANGUAGE_TERM_THEN_REQUIREMENT_RE.search(norm):
-        return False
-
-    # Guardrail: keep blocking if text also contains explicit NL/DE mandatory wording.
-    explicit_block_patterns = LANGUAGE_REQUIRED_PATTERNS.get("nl", []) + LANGUAGE_REQUIRED_PATTERNS.get("de", [])
-    if any(re.search(pattern, norm) for pattern in explicit_block_patterns):
-        return False
-    return True
+    return bool(classify_language_need(text).get("acceptable_without_dutch", False))
 
 
 INTERNSHIP_ALLOW_MARKERS = [
@@ -822,6 +1136,27 @@ EXPERIENCE_JUNIOR_TITLE_MARKERS = [
     "early careers",
 ]
 
+# Extra junior-like context markers from title OR description.
+# These markers are used to de-risk strict "3+ years" parsing when the ad
+# clearly positions itself as junior/graduate onboarding.
+EXPERIENCE_JUNIOR_CONTEXT_MARKERS = [
+    "junior",
+    "graduate",
+    "entry level",
+    "entry-level",
+    "trainee",
+    "traineeship",
+    "starter",
+    "will be trained",
+    "training provided",
+    "we hire for potential",
+    "hire for potential",
+    "no prior experience required",
+    "no experience required",
+    "open to graduates",
+    "young talent",
+]
+
 
 EXPERIENCE_SOFT_SIGNAL_PHRASES = [
     "experience confirmee",
@@ -843,7 +1178,7 @@ EXPERIENCE_YEARS_PATTERNS = [
 ]
 
 EXPERIENCE_RANGE_PATTERNS = [
-    r"\b(?P<start>\d{1,2})\s*(?:-|to|a)\s*(?P<end>\d{1,2})\s*(?:years?|ans?)\b",
+    r"\b(?P<start>\d{1,2})\s*(?:-|–|to|a|/)\s*(?P<end>\d{1,2})\s*(?:years?|ans?)\b",
 ]
 
 def _near_experience_context(text_norm: str, start: int, end: int) -> bool:
@@ -869,8 +1204,13 @@ def _match_phrase_list(text_norm: str, phrases: list[str]) -> str:
     return ""
 
 
-def _extract_years_required(text_norm: str) -> tuple[int | None, str]:
-    candidates: list[tuple[int, str]] = []
+def _extract_years_required(text_norm: str) -> tuple[int | None, str, bool]:
+    """
+    Extract strongest explicit years requirement.
+    Returns:
+      (years_required, detail, is_range)
+    """
+    candidates: list[tuple[int, str, bool]] = []
     max_reasonable_years = 15
 
     for pattern in EXPERIENCE_RANGE_PATTERNS:
@@ -882,7 +1222,8 @@ def _extract_years_required(text_norm: str) -> tuple[int | None, str]:
             if end < start:
                 continue
             if _near_experience_context(text_norm, match.start(), match.end()):
-                candidates.append((start, match.group(0)))
+                token = re.sub(r"\s+", " ", match.group(0)).strip()
+                candidates.append((end, token, True))
 
     for pattern in EXPERIENCE_YEARS_PATTERNS:
         for match in re.finditer(pattern, text_norm):
@@ -891,14 +1232,16 @@ def _extract_years_required(text_norm: str) -> tuple[int | None, str]:
                 continue
             token = match.group(0)
             if "experience" in token or _near_experience_context(text_norm, match.start(), match.end()):
-                candidates.append((years, token))
+                token = re.sub(r"\s+", " ", token).strip()
+                candidates.append((years, token, False))
 
     if not candidates:
-        return None, ""
+        return None, "", False
 
-    # Use the strongest explicit requirement.
-    years_required = max(years for years, _ in candidates)
-    return years_required, f"{years_required}+ years"
+    # Keep the strongest explicit requirement while preserving whether it was a range.
+    best = sorted(candidates, key=lambda item: (item[0], item[2]), reverse=True)[0]
+    years_required, detail, is_range = best
+    return years_required, detail or f"{years_required}+ years", is_range
 
 
 def internship_student_only_detail(title: str, desc: str) -> str:
@@ -965,24 +1308,38 @@ def detect_experience_requirement_details(title: str, desc: str) -> tuple[str, s
         return "none", "", None
 
     has_junior_title = any(keyword_hit(title_norm, marker, boundary_only=True) for marker in EXPERIENCE_JUNIOR_TITLE_MARKERS)
+    has_junior_context = any(
+        keyword_hit(text_norm, marker, boundary_only=True) for marker in EXPERIENCE_JUNIOR_CONTEXT_MARKERS
+    )
 
-    years_required, detail = _extract_years_required(text_norm)
+    years_required, detail, is_range = _extract_years_required(text_norm)
     if years_required is not None:
+        # 5+ years remains a strict hard block even if "junior" appears in text.
         if years_required >= 5:
-            if has_junior_title:
-                return "soft_junior_title", detail, years_required
             return "hard", detail, years_required
+
+        # "3+ years" with junior/graduate signals is likely inflated HR wording:
+        # keep as manual-review signal, not hard block.
         if years_required >= 3:
-            if has_junior_title:
-                return "soft_junior_title", detail, years_required
+            if has_junior_context or has_junior_title:
+                return "soft_junior_title", "years_required_conflict_but_junior_signals", years_required
             return "soft", detail, years_required
+
+        # 2-3 years ranges are accepted; no hard block.
+        if is_range and years_required <= 3:
+            if has_junior_context or has_junior_title:
+                return "soft_junior_title", "years_required_conflict_but_junior_signals", years_required
+            return "soft", detail, years_required
+
         return "none", "", years_required
 
     hard_phrase = _match_phrase_list(text_norm, EXPERIENCE_HARD_BLOCK_PHRASES)
     if hard_phrase:
         years_from_phrase = _years_from_text(hard_phrase)
-        if has_junior_title:
-            return "soft_junior_title", hard_phrase, years_from_phrase
+        if years_from_phrase is not None and years_from_phrase >= 5:
+            return "hard", hard_phrase, years_from_phrase
+        if has_junior_context or has_junior_title:
+            return "soft_junior_title", "years_required_conflict_but_junior_signals", years_from_phrase
         return "hard", hard_phrase, years_from_phrase
 
     soft_phrase = _match_phrase_list(text_norm, EXPERIENCE_SOFT_BLOCK_PHRASES)
@@ -990,11 +1347,17 @@ def detect_experience_requirement_details(title: str, desc: str) -> tuple[str, s
         years_from_phrase = _years_from_text(soft_phrase)
         if years_from_phrase is not None and years_from_phrase <= 2:
             return "none", "", years_from_phrase
-        return ("soft_junior_title" if has_junior_title else "soft", soft_phrase, years_from_phrase)
+        if years_from_phrase is not None and years_from_phrase >= 5:
+            return "hard", soft_phrase, years_from_phrase
+        if has_junior_context or has_junior_title:
+            return "soft_junior_title", "years_required_conflict_but_junior_signals", years_from_phrase
+        return "soft", soft_phrase, years_from_phrase
 
     for marker in EXPERIENCE_SOFT_SIGNAL_PHRASES:
         if keyword_hit(text_norm, marker, boundary_only=True):
-            return ("soft_junior_title" if has_junior_title else "soft", marker, None)
+            if has_junior_context or has_junior_title:
+                return "soft_junior_title", "years_required_conflict_but_junior_signals", None
+            return "soft", marker, None
 
     return "none", "", None
 
@@ -1132,6 +1495,54 @@ ROLE_TITLE_FALLBACK_PATTERNS = [
     r"\b(system|linux)\s+administrator\b",
 ]
 
+# Optional, narrow role broadening for DevOps/Infra junior profiles.
+# Guardrails:
+# - must look infra/cloud-ish
+# - explicitly reject industrial automation contexts (PLC/SCADA/HVAC/BMS)
+ROLE_ALIAS_SAFE_KEYWORDS = [
+    "platform engineer",
+    "infra engineer",
+    "infrastructure engineer",
+    "linux engineer",
+    "sysadmin",
+    "system administrator",
+    "cloud operations engineer",
+    "cloud operations",
+    "cloud infrastructure",
+    "automation engineer",
+]
+
+ROLE_ALIAS_TECH_SIGNALS = [
+    "ci/cd",
+    "kubernetes",
+    "docker",
+    "terraform",
+    "ansible",
+    "linux",
+    "devops",
+    "sre",
+    "platform",
+    "infrastructure",
+    "cloud",
+    "aws",
+    "azure",
+    "gcp",
+    "iac",
+    "helm",
+]
+
+ROLE_ALIAS_INDUSTRIAL_BLOCKERS = [
+    "plc",
+    "scada",
+    "hvac",
+    "bms",
+    "siemens s7",
+    "process control",
+    "electrical",
+    "automation industrielle",
+    "industrial automation",
+]
+
 
 def role_title_fallback_relevant(title: str) -> bool:
     """
@@ -1141,6 +1552,30 @@ def role_title_fallback_relevant(title: str) -> bool:
     if any(keyword_hit(t, kw, boundary_only=True) for kw in ROLE_TITLE_FALLBACK_KEYWORDS):
         return True
     return any(re.search(pattern, t) is not None for pattern in ROLE_TITLE_FALLBACK_PATTERNS)
+
+
+def role_alias_safe_relevant(title: str, desc: str) -> bool:
+    """
+    Recover safe infra aliases without opening non-target industrial automation noise.
+    """
+    title_norm = normalize_text(title or "")
+    text_norm = normalize_text(f"{title or ''} {desc or ''}")
+    if not text_norm:
+        return False
+
+    if any(keyword_hit(text_norm, bad, boundary_only=True) for bad in ROLE_ALIAS_INDUSTRIAL_BLOCKERS):
+        return False
+
+    alias_hits = [kw for kw in ROLE_ALIAS_SAFE_KEYWORDS if keyword_hit(title_norm, kw, boundary_only=True)]
+    if not alias_hits:
+        return False
+
+    # "Automation Engineer" is broad; keep it only when explicit infra/tooling signals exist.
+    if "automation engineer" in alias_hits:
+        if not any(keyword_hit(text_norm, sig, boundary_only=True) for sig in ROLE_ALIAS_TECH_SIGNALS):
+            return False
+
+    return True
 
 
 ROLE_FORBIDDEN_CONTEXT_SKIP = {"keycloak", "commercial", "delivery"}
@@ -1278,6 +1713,9 @@ def role_relevant(title: str, desc: str) -> bool:
     if training_program_relevant(title, desc):
         return True
 
+    if role_alias_safe_relevant(title, desc):
+        return True
+
     return role_title_fallback_relevant(title)
 
 
@@ -1369,24 +1807,37 @@ def compute_junior_score(title: str, desc: str) -> int:
 def compute_language_fit_score(title: str, desc: str) -> int:
     """
     Return language fit in [0..2]:
-      - 2: FR and/or EN explicitly required, NL/DE not required
-      - 1: requirement unclear, but text is EN/FR-friendly
-      - 0: NL/DE explicitly required (or Dutch/German-only wording)
+      - 2: FR/EN acceptable (including English-only acceptable)
+      - 1: FR/EN acceptable but Dutch appears as preference (plus/asset)
+      - 0: blocked language (NL/DE) explicitly required
     """
     text = f"{title or ''} {desc or ''}"
-    req = language_requirements(text)
-    required = set(req.get("required_langs", set()))
+    need = classify_language_need(text)
+    required = set(need.get("required_langs", set()))
+    optional = set(need.get("optional_langs", set()))
 
-    if required.intersection({"nl", "de"}):
+    if need.get("requires_blocked_language", False):
         return 0
+    if need.get("prefers_dutch", False):
+        return 1
+
+    # Clear FR/EN acceptance signals.
     if required.intersection({"fr", "en"}):
+        return 2
+    if need.get("english_only", False):
+        return 2
+    if need.get("acceptable_without_dutch", False):
         return 2
 
     norm = normalize_text(text)
-    if re.search(r"\b(dutch|nederlands|german|deutsch)\s+only\b", norm):
-        return 0
     has_fr_or_en_signal = bool(_extract_language_codes(norm).intersection({"fr", "en"}))
-    return 1 if has_fr_or_en_signal or bool(norm) else 0
+    if has_fr_or_en_signal:
+        return 2
+
+    # Keep neutral fallback to avoid over-penalizing sparse descriptions.
+    if optional.intersection({"fr", "en"}):
+        return 2
+    return 1 if bool(norm) else 0
 
 
 def compute_priority_score(
@@ -1605,7 +2056,12 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
     if experience_level == "hard":
         return None
 
-    blocked_language_reason = blocked_language_requirement_reason(full_text)
+    # Keep two views:
+    # - mode-aware reason for filtering decision
+    # - strict reason for diagnostics/CSV transparency
+    blocked_language_reason = blocked_language_requirement_reason(full_text, filter_mode=mode)
+    blocked_language_reason_strict = blocked_language_requirement_reason(full_text, filter_mode="strict")
+    language_need = classify_language_need(full_text)
     if blocked_language_reason:
         return None
 
@@ -1647,7 +2103,17 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
         "years_required": years_required if years_required is not None else "",
         "experience_level": experience_level,
         "experience_detail": normalize_text(experience_detail) if experience_detail else "",
-        "blocked_language_reason": blocked_language_reason,
+        "blocked_language_reason": blocked_language_reason_strict,
+        "language_need_label": (
+            "requires_blocked_language"
+            if language_need.get("requires_blocked_language")
+            else "prefers_dutch"
+            if language_need.get("prefers_dutch")
+            else "acceptable_without_dutch"
+            if language_need.get("acceptable_without_dutch")
+            else "fr_en_ok"
+        ),
+        "language_need_signals": " | ".join(language_need.get("signals", [])),
         "disallowed_language_detected": disallowed_language_detected,
         "filter_mode": mode,
         "source": source,
@@ -1801,7 +2267,28 @@ def main():
         action="store_true",
         help="Ne pas appeler l'API, utiliser uniquement le CSV brut existant",
     )
+    parser.add_argument(
+        "--self-test-exclude-keywords",
+        action="store_true",
+        help="Run local exclude-keyword self-tests and exit.",
+    )
+    parser.add_argument(
+        "--self-checks",
+        action="store_true",
+        help="Run local language/experience self-checks and exit.",
+    )
     args = parser.parse_args()
+    if args.self_test_exclude_keywords:
+        run_exclude_keyword_self_tests()
+        return
+    if args.self_checks:
+        run_self_checks()
+        return
+
+    # Optional non-breaking trigger for CI/local quick checks:
+    # RUN_SELF_CHECKS=1 python adzuna_fetch.py --no-fetch --market be --filter-mode strict
+    if os.getenv("RUN_SELF_CHECKS", "").strip().lower() in {"1", "true", "yes", "on"}:
+        run_self_checks()
 
     global ACTIVE_FILTER_MODE
     configure_market(args.market, args.ch_focus)

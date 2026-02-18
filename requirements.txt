@@ -3,3 +3,4 @@ pandas
 langdetect
 rapidfuzz
 beautifulsoup4
+playwright

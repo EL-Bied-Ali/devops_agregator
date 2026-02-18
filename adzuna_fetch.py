@@ -719,6 +719,28 @@ def run_self_checks():
         f"level={lvl_10} detail={detail_10} years={years_10}",
     )
 
+    # 11) Hiring likelihood should prefer junior-friendly copy.
+    need_11 = classify_language_need("English required. Dutch is a plus.")
+    hire_11, _reasons_11 = compute_hiring_likelihood_score(
+        "Junior DevOps Engineer",
+        "Training provided. No experience required.",
+        years_required=1,
+        experience_level="none",
+        language_need=need_11,
+    )
+    check("Hiring likelihood junior-friendly => positive", hire_11 > 0, f"score={hire_11}")
+
+    # 12) Hiring likelihood should penalize clear senior constraints.
+    need_12 = classify_language_need("Fluent Dutch required.")
+    hire_12, _reasons_12 = compute_hiring_likelihood_score(
+        "Principal Cloud Architect",
+        "At least 7 years experience required.",
+        years_required=7,
+        experience_level="hard",
+        language_need=need_12,
+    )
+    check("Hiring likelihood senior+blocked language => negative", hire_12 < 0, f"score={hire_12}")
+
     # Keep previous keyword-specific checks.
     run_exclude_keyword_self_tests()
     print(f"[SELFCHECK] Summary: {passed}/{total} checks passed")
@@ -1882,6 +1904,91 @@ def compute_junior_score(title: str, desc: str) -> int:
     return score
 
 
+HIRE_POSITIVE_MARKERS = [
+    "junior",
+    "graduate",
+    "trainee",
+    "entry level",
+    "training provided",
+    "will be trained",
+    "we hire for potential",
+    "no prior experience required",
+    "no experience required",
+    "starter",
+]
+
+HIRE_NEGATIVE_MARKERS = [
+    "team lead",
+    "technical lead",
+    "tech lead",
+    "head of",
+    "director",
+    "principal",
+    "staff engineer",
+    "senior",
+    "architect",
+    "contractor",
+    "freelance",
+]
+
+
+def compute_hiring_likelihood_score(
+    title: str,
+    desc: str,
+    years_required: int | None,
+    experience_level: str,
+    language_need: dict | None = None,
+) -> tuple[int, list[str]]:
+    """
+    Estimate how likely the role is to be realistically attainable for a junior profile.
+    This score is intentionally separate from pure relevance score.
+    """
+    text = normalize_text(f"{title or ''} {desc or ''}")
+    score = 0
+    reasons: list[str] = []
+
+    for marker in HIRE_POSITIVE_MARKERS:
+        if keyword_hit(text, marker, boundary_only=True):
+            score += 2
+            reasons.append(f"plus:{marker}")
+
+    for marker in HIRE_NEGATIVE_MARKERS:
+        if keyword_hit(text, marker, boundary_only=True):
+            score -= 2
+            reasons.append(f"minus:{marker}")
+
+    if years_required is not None:
+        if years_required <= 2:
+            score += 4
+            reasons.append("plus:years<=2")
+        elif years_required == 3:
+            # Keep borderline cases reachable, especially with junior signals.
+            score += 1 if experience_level == "soft_junior_title" else -1
+            reasons.append("mixed:years=3")
+        elif years_required == 4:
+            score -= 3
+            reasons.append("minus:years=4")
+        elif years_required >= 5:
+            score -= 8
+            reasons.append("minus:years>=5")
+
+    if experience_level == "soft_junior_title":
+        score += 2
+        reasons.append("plus:junior_signals_despite_experience")
+
+    lang_need = language_need or {}
+    if lang_need.get("requires_blocked_language"):
+        score -= 6
+        reasons.append("minus:blocked_language_required")
+    elif lang_need.get("prefers_dutch"):
+        score -= 2
+        reasons.append("minus:dutch_preferred")
+
+    # Keep score bounded and stable for ranking.
+    score = max(-20, min(20, score))
+    return score, reasons[:8]
+
+
 def compute_language_fit_score(title: str, desc: str) -> int:
     """
     Return language fit in [0..2]:
@@ -1925,6 +2032,7 @@ def compute_priority_score(
     created: str,
     junior_score: int,
     language_fit_score: int,
+    hiring_likelihood_score: int = 0,
 ) -> int:
     """
     Rank jobs by apply-first priority.
@@ -1933,6 +2041,9 @@ def compute_priority_score(
     text = normalize((title or "") + " " + (desc or ""))
     loc_norm = normalize(loc or "")
     score = 50 + max(0, junior_score) * 2 + language_fit_score * 2
+    # Blend in a bounded hiring-likelihood component so top rows are both relevant
+    # and realistically attainable for junior applications.
+    score += max(-4, min(6, int(hiring_likelihood_score)))
 
     for term, weight in ACTIVE_PRIORITY_TERMS.items():
         if normalize(term) in text:
@@ -2154,6 +2265,13 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
     if junior_score < min_junior_score:
         return None
     language_fit_score = compute_language_fit_score(title, desc)
+    hiring_likelihood_score, hiring_likelihood_reasons = compute_hiring_likelihood_score(
+        title=title,
+        desc=desc,
+        years_required=years_required,
+        experience_level=experience_level,
+        language_need=language_need,
+    )
 
     return {
         "title": title,
@@ -2168,6 +2286,8 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
         "search_term": job.get("search_term", ""),
         "junior_score": junior_score,
         "language_fit_score": language_fit_score,
+        "hiring_likelihood_score": hiring_likelihood_score,
+        "hiring_likelihood_reasons": " | ".join(hiring_likelihood_reasons),
         "priority_score": compute_priority_score(
             title,
             desc,
@@ -2175,6 +2295,7 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
             created,
             junior_score,
             language_fit_score,
+            hiring_likelihood_score,
         ),
         "is_remote": work_mode in {"remote", "hybrid"},
         "work_mode": work_mode,
@@ -2216,7 +2337,7 @@ def build_filtered_df(all_jobs: list[dict], filter_mode: str, source: str = "adz
             df_f["canonical_url"] = ""
     if not df_f.empty:
         df_f = df_f.drop_duplicates(subset=["canonical_url", "title", "company"])
-        sort_cols = [c for c in ["priority_score", "junior_score", "created"] if c in df_f.columns]
+        sort_cols = [c for c in ["hiring_likelihood_score", "priority_score", "junior_score", "created"] if c in df_f.columns]
         if sort_cols:
             df_f = df_f.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
     after = len(df_f)
@@ -2282,6 +2403,7 @@ def near_miss_location_only(job: dict, min_priority: int = 68, source: str = "ad
     if experience_level == "hard":
         return None
 
+    language_need = classify_language_need(full_text)
     if blocked_language_requirement_reason(full_text):
         return None
 
@@ -2293,7 +2415,22 @@ def near_miss_location_only(job: dict, min_priority: int = 68, source: str = "ad
         return None
 
     language_fit_score = compute_language_fit_score(title, desc)
-    priority_score = compute_priority_score(title, desc, loc, created, junior_score, language_fit_score)
+    hiring_likelihood_score, hiring_likelihood_reasons = compute_hiring_likelihood_score(
+        title=title,
+        desc=desc,
+        years_required=years_required,
+        experience_level=experience_level,
+        language_need=language_need,
+    )
+    priority_score = compute_priority_score(
+        title,
+        desc,
+        loc,
+        created,
+        junior_score,
+        language_fit_score,
+        hiring_likelihood_score,
+    )
     if priority_score < min_priority:
         return None
 
@@ -2308,6 +2445,8 @@ def near_miss_location_only(job: dict, min_priority: int = 68, source: str = "ad
         "search_term": job.get("search_term", ""),
         "junior_score": junior_score,
         "language_fit_score": language_fit_score,
+        "hiring_likelihood_score": hiring_likelihood_score,
+        "hiring_likelihood_reasons": " | ".join(hiring_likelihood_reasons),
         "priority_score": priority_score,
         "is_remote": work_mode in {"remote", "hybrid"},
         "work_mode": work_mode,

@@ -1543,6 +1543,45 @@ ROLE_ALIAS_INDUSTRIAL_BLOCKERS = [
     "industrial automation",
 ]
 
+# Strong role signals we trust when present in the title.
+# We prefer title evidence over description evidence to reduce noisy matches
+# coming from generic company text in long descriptions.
+ROLE_TITLE_PRIMARY_SIGNALS = [
+    "devops",
+    "sre",
+    "site reliability",
+    "platform engineer",
+    "cloud engineer",
+    "cloud operations",
+    "system administrator",
+    "sysadmin",
+    "linux administrator",
+    "infrastructure engineer",
+    "it support",
+    "service desk",
+    "helpdesk",
+    "application support",
+]
+
+# Description-only matches must include concrete infra/tooling signals.
+ROLE_DESC_INFRA_EVIDENCE = [
+    "kubernetes",
+    "docker",
+    "terraform",
+    "ansible",
+    "ci/cd",
+    "linux",
+    "azure",
+    "aws",
+    "gcp",
+    "observability",
+    "incident management",
+    "infrastructure as code",
+    "iac",
+    "helm",
+    "prometheus",
+]
+
 
 def role_title_fallback_relevant(title: str) -> bool:
     """
@@ -1576,6 +1615,40 @@ def role_alias_safe_relevant(title: str, desc: str) -> bool:
             return False
 
     return True
+
+
+def _has_primary_role_title_signal(title: str) -> bool:
+    title_norm = normalize_text(title or "")
+    if not title_norm:
+        return False
+    return any(keyword_hit(title_norm, sig, boundary_only=True) for sig in ROLE_TITLE_PRIMARY_SIGNALS)
+
+
+def _required_keywords_match_reliably(title: str, desc: str) -> bool:
+    """
+    Evaluate ROLE_REQUIRED_KEYWORDS with stricter evidence to avoid description-only noise.
+    Rules:
+    - title hit => accept (high confidence)
+    - description-only hit => require concrete infra/tooling evidence
+    """
+    title_norm = normalize_text(title or "")
+    desc_norm = normalize_text(desc or "")
+    full_text = normalize_text(f"{title or ''} {desc or ''}")
+    if not full_text:
+        return False
+
+    required_hits = [kw for kw in ROLE_REQUIRED_KEYWORDS if keyword_hit(full_text, kw, boundary_only=True)]
+    if not required_hits:
+        return False
+
+    # Any required keyword explicitly in title is a strong positive signal.
+    if any(keyword_hit(title_norm, kw, boundary_only=True) for kw in required_hits):
+        return True
+
+    # Description-only matches are accepted only when they look truly infra-focused.
+    has_infra_evidence = any(keyword_hit(desc_norm, sig, boundary_only=True) for sig in ROLE_DESC_INFRA_EVIDENCE)
+    has_industrial_noise = any(keyword_hit(desc_norm, bad, boundary_only=True) for bad in ROLE_ALIAS_INDUSTRIAL_BLOCKERS)
+    return bool(has_infra_evidence and not has_industrial_noise)
 
 
 ROLE_FORBIDDEN_CONTEXT_SKIP = {"keycloak", "commercial", "delivery"}
@@ -1703,7 +1776,12 @@ def role_relevant(title: str, desc: str) -> bool:
     if role_forbidden_reason(title, desc):
         return False
 
-    if any(keyword_hit(text, good, boundary_only=True) for good in ROLE_REQUIRED_KEYWORDS):
+    # Title-first positive signal for target roles.
+    if _has_primary_role_title_signal(title):
+        return True
+
+    # Required keyword logic with extra description guardrails.
+    if _required_keywords_match_reliably(title, desc):
         return True
 
     if ACTIVE_JOB_MODE == "speed":

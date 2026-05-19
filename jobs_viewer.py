@@ -11,6 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
+import unicodedata
 import webbrowser
 from html import escape
 from pathlib import Path
@@ -20,12 +23,17 @@ from pandas.errors import EmptyDataError
 
 import adzuna_fetch as af
 import filter_impact as fi
-from config import get_output_paths, resolve_filter_mode
+from config import SUPPORTED_CH_FOCUS, SUPPORTED_MARKETS, get_output_paths, resolve_filter_mode
 
 
 DEFAULT_INPUT = "data/adzuna_jobs_filtered_strict_enriched.csv"
 DEFAULT_OUTPUT = "data/job_viewer.html"
-
+MA_LOCATION_FOCUS_CLUSTERS = {
+    "rabat": ["rabat", "sale", "salé", "technopolis", "skhirat", "temara", "témara"],
+    "casablanca": ["casablanca", "mohammedia", "bouskoura", "nouaceur", "sidi maarouf", "sidi maârouf"],
+    "tanger": ["tanger", "tangier", "tetouan", "tétouan"],
+    "rabat_or_remote": ["rabat", "sale", "salé", "technopolis", "skhirat", "temara", "témara"],
+}
 
 def safe_read_csv(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
@@ -35,8 +43,39 @@ def safe_read_csv(path: str) -> pd.DataFrame:
     except EmptyDataError:
         return pd.DataFrame()
 
+def normalize_match_text(*values: str) -> str:
+    raw = " ".join(str(v or "") for v in values if str(v or ""))
+    folded = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    return " ".join(folded.lower().split())
+
+def resolve_location_focus_terms(location_focus: str, market: str) -> list[str]:
+    focus = normalize_match_text(location_focus)
+    if not focus:
+        return []
+    if market == "ma" and focus in MA_LOCATION_FOCUS_CLUSTERS:
+        return [normalize_match_text(token) for token in MA_LOCATION_FOCUS_CLUSTERS[focus]]
+    return [focus]
+
+def record_matches_location_focus(record: dict, location_focus: str, market: str) -> bool:
+    terms = resolve_location_focus_terms(location_focus, market)
+    if not terms:
+        return True
+    if market == "ma" and normalize_match_text(location_focus) == "rabat_or_remote" and bool(record.get("is_remote", False)):
+        return True
+    loc_norm = normalize_match_text(record.get("location", ""))
+    return any(term in loc_norm for term in terms)
+
+def location_focus_path(path: str, location_focus: str) -> str:
+    focus = normalize_match_text(location_focus)
+    if not focus:
+        return path
+    safe_focus = focus.replace(" ", "_")
+    p = Path(path)
+    return str(p.with_name(f"{p.stem}_{safe_focus}{p.suffix}"))
+
 
 def build_records(df: pd.DataFrame) -> list[dict]:
+    existing_columns = set(df.columns)
     wanted = [
         "title",
         "company",
@@ -65,6 +104,8 @@ def build_records(df: pd.DataFrame) -> list[dict]:
         "combined_len",
         "url",
         "canonical_url",
+        "source_url",
+        "source_canonical_url",
         "fetch_used_url",
         "working_url",
         "combined_description",
@@ -73,6 +114,18 @@ def build_records(df: pd.DataFrame) -> list[dict]:
     for col in wanted:
         if col not in df.columns:
             df[col] = ""
+
+    has_recheck_columns = any(
+        col in existing_columns
+        for col in [
+            "apply_ready_after_recheck",
+            "manual_review_after_recheck",
+            "hard_excluded_after_recheck",
+            "keep_before_recheck",
+            "keep_after_full_recheck",
+            "keep_after_recheck",
+        ]
+    )
 
     def as_text(v) -> str:
         if pd.isna(v):
@@ -94,12 +147,23 @@ def build_records(df: pd.DataFrame) -> list[dict]:
         combined = as_text(row.get("combined_description", "")).strip()
         preview = as_text(row.get("description", "")).strip()
         desc = combined if combined else preview
-        keep_after_recheck = str(row.get("keep_after_recheck", "")).strip().lower() in ("1", "true", "yes")
-        hard_excluded = str(row.get("hard_excluded_after_recheck", "")).strip().lower() in ("1", "true", "yes")
-        manual_review = str(row.get("manual_review_after_recheck", "")).strip().lower() in ("1", "true", "yes")
-        apply_ready = str(row.get("apply_ready_after_recheck", "")).strip().lower() in ("1", "true", "yes")
-        if not apply_ready:
-            apply_ready = bool(keep_after_recheck and not hard_excluded and not manual_review)
+        if has_recheck_columns:
+            keep_after_recheck = str(row.get("keep_after_recheck", "")).strip().lower() in ("1", "true", "yes")
+            hard_excluded = str(row.get("hard_excluded_after_recheck", "")).strip().lower() in ("1", "true", "yes")
+            manual_review = str(row.get("manual_review_after_recheck", "")).strip().lower() in ("1", "true", "yes")
+            apply_ready = str(row.get("apply_ready_after_recheck", "")).strip().lower() in ("1", "true", "yes")
+            keep_before_recheck = str(row.get("keep_before_recheck", "")).strip().lower() in ("1", "true", "yes")
+            keep_after_full_recheck = str(row.get("keep_after_full_recheck", "")).strip().lower() in ("1", "true", "yes")
+            if not apply_ready:
+                apply_ready = bool(keep_after_recheck and not hard_excluded and not manual_review)
+        else:
+            # Plain strict/broad CSV without recheck columns: treat visible rows as already usable.
+            keep_before_recheck = True
+            keep_after_full_recheck = True
+            keep_after_recheck = True
+            hard_excluded = False
+            manual_review = False
+            apply_ready = True
 
         records.append(
             {
@@ -111,12 +175,13 @@ def build_records(df: pd.DataFrame) -> list[dict]:
                 "priority_score": as_int(row.get("priority_score", 0), default=0),
                 "junior_score": as_int(row.get("junior_score", 0), default=0),
                 "language_fit_score": as_int(row.get("language_fit_score", 0), default=0),
+                "sponsorship_score": as_int(row.get("sponsorship_score", 0), default=0),
+                "hiring_likelihood_score": as_int(row.get("hiring_likelihood_score", 0), default=0),
                 "is_remote": str(row.get("is_remote", "")).strip().lower() in ("1", "true", "yes"),
                 "keep_after_recheck": keep_after_recheck,
                 "apply_ready_after_recheck": apply_ready,
-                "keep_before_recheck": str(row.get("keep_before_recheck", "")).strip().lower() in ("1", "true", "yes"),
-                "keep_after_full_recheck": str(row.get("keep_after_full_recheck", "")).strip().lower()
-                in ("1", "true", "yes"),
+                "keep_before_recheck": keep_before_recheck,
+                "keep_after_full_recheck": keep_after_full_recheck,
                 "hard_excluded_after_recheck": hard_excluded,
                 "manual_review_after_recheck": manual_review,
                 "manual_review_reason": as_text(row.get("manual_review_reason", "")),
@@ -142,6 +207,8 @@ def build_records(df: pd.DataFrame) -> list[dict]:
                 "combined_len": as_int(row.get("combined_len", 0), default=0),
                 "url": as_text(row.get("url", "")),
                 "canonical_url": as_text(row.get("canonical_url", "")),
+                "source_url": as_text(row.get("source_url", "")),
+                "source_canonical_url": as_text(row.get("source_canonical_url", "")),
                 "fetch_used_url": as_text(row.get("fetch_used_url", "")),
                 "working_url": as_text(row.get("working_url", "")),
                 "description": desc,
@@ -223,7 +290,7 @@ def compute_raw_to_strict_impact(raw_csv: str, filter_mode: str) -> dict:
             "steps": [],
             "final_after_dedup": 0,
             "what_if_skip": [],
-            "detail_breakdown": [],
+            "analysis_trimmed": True,
         }
 
     raw_jobs = fi.load_raw_jobs(raw_csv)
@@ -247,7 +314,6 @@ def compute_raw_to_strict_impact(raw_csv: str, filter_mode: str) -> dict:
         ("junior_score", lambda job: fi.check_junior(job["title"], job["description"], mode)),
     ]
 
-    first_fail_breakdown: dict[str, dict[str, dict]] = {name: {} for name, _ in steps}
     current = list(all_jobs)
     step_rows = []
     for step_name, fn in steps:
@@ -256,28 +322,8 @@ def compute_raw_to_strict_impact(raw_csv: str, filter_mode: str) -> dict:
         for job in current:
             result = fn(job)
             ok = bool(result[0])
-            detail = str(result[1] if len(result) > 1 else "").strip() or "no_detail"
             if ok:
                 kept.append(job)
-            else:
-                step_map = first_fail_breakdown[step_name]
-                bucket = step_map.setdefault(
-                    detail,
-                    {
-                        "count": 0,
-                        "samples": [],
-                    },
-                )
-                bucket["count"] += 1
-                if len(bucket["samples"]) < 6:
-                    bucket["samples"].append(
-                        {
-                            "title": str(job.get("title", "") or ""),
-                            "company": str(job.get("company", "") or ""),
-                            "location": str(job.get("location", "") or ""),
-                            "url": str(job.get("url", "") or ""),
-                        }
-                    )
         removed = before - len(kept)
         pct = round((removed * 100.0 / before), 1) if before else 0.0
         step_rows.append({"step": step_name, "before": before, "removed": removed, "kept": len(kept), "pct_removed": pct})
@@ -291,103 +337,14 @@ def compute_raw_to_strict_impact(raw_csv: str, filter_mode: str) -> dict:
     else:
         final_after_dedup = 0
 
-    def run_with_skip(skip_step: str) -> int:
-        cur = list(all_jobs)
-        for name, fn in steps:
-            if name == skip_step:
-                continue
-            nxt = []
-            for job in cur:
-                ok = fn(job)[0]
-                if ok:
-                    nxt.append(job)
-            cur = nxt
-        if not cur:
-            return 0
-        df = pd.DataFrame(cur)
-        return int(len(df.drop_duplicates(subset=["canonical_url", "title", "company"], keep="first")))
-
-    what_if = []
-    for step_name, _ in steps:
-        alt = run_with_skip(step_name)
-        what_if.append({"step": step_name, "final_if_skipped": alt, "delta_vs_strict": int(alt - final_after_dedup)})
-    what_if.sort(key=lambda x: x["delta_vs_strict"], reverse=True)
-
-    # All-hits breakdown: a row can fail multiple filters (no early-stop).
-    all_hits_map: dict[str, dict[str, dict]] = {name: {} for name, _ in steps}
-    for job in all_jobs:
-        for step_name, fn in steps:
-            result = fn(job)
-            ok = bool(result[0])
-            if ok:
-                continue
-            detail = str(result[1] if len(result) > 1 else "").strip() or "no_detail"
-            step_map = all_hits_map[step_name]
-            bucket = step_map.setdefault(detail, {"count": 0, "samples": []})
-            bucket["count"] += 1
-            if len(bucket["samples"]) < 6:
-                bucket["samples"].append(
-                    {
-                        "title": str(job.get("title", "") or ""),
-                        "company": str(job.get("company", "") or ""),
-                        "location": str(job.get("location", "") or ""),
-                        "url": str(job.get("url", "") or ""),
-                    }
-                )
-
-    all_hits_breakdown = []
-    for step_name, _ in steps:
-        details = []
-        total_fail = 0
-        for detail, payload in all_hits_map[step_name].items():
-            count = int(payload["count"])
-            total_fail += count
-            details.append(
-                {
-                    "detail": detail,
-                    "count": count,
-                    "samples": payload["samples"],
-                }
-            )
-        details.sort(key=lambda x: x["count"], reverse=True)
-        all_hits_breakdown.append(
-            {
-                "step": step_name,
-                "failed_count": total_fail,
-                "details": details,
-            }
-        )
-
-    detail_breakdown = []
-    for step_name, _ in steps:
-        details = []
-        for detail, payload in first_fail_breakdown[step_name].items():
-            details.append(
-                {
-                    "detail": detail,
-                    "count": int(payload["count"]),
-                    "samples": payload["samples"],
-                }
-            )
-        details.sort(key=lambda x: x["count"], reverse=True)
-        removed_at_step = next((int(s["removed"]) for s in step_rows if s["step"] == step_name), 0)
-        detail_breakdown.append(
-            {
-                "step": step_name,
-                "removed": removed_at_step,
-                "details": details,
-            }
-        )
-
     return {
         "available": True,
         "raw_csv": raw_csv,
         "raw_rows": len(all_jobs),
         "steps": step_rows,
         "final_after_dedup": final_after_dedup,
-        "what_if_skip": what_if,
-        "detail_breakdown": detail_breakdown,
-        "all_hits_breakdown": all_hits_breakdown,
+        "what_if_skip": [],
+        "analysis_trimmed": True,
     }
 
 
@@ -418,147 +375,20 @@ def compute_strict_funnel(records: list[dict]) -> dict:
     }
 
 
-def write_raw_detail_report(raw_impact: dict, output_path: Path):
-    """Write a detailed raw->strict report with all-hits and first-fail views."""
-    if not raw_impact.get("available", False):
-        return
-
-    sections_all_hits = []
-    for step in raw_impact.get("all_hits_breakdown", []):
-        step_name = escape(str(step.get("step", "")))
-        removed = int(step.get("failed_count", 0) or 0)
-        detail_rows = []
-        for d in step.get("details", []):
-            detail = escape(str(d.get("detail", "")))
-            count = int(d.get("count", 0) or 0)
-            samples_html = []
-            for s in d.get("samples", []):
-                t = escape(str(s.get("title", "")))
-                c = escape(str(s.get("company", "")))
-                l = escape(str(s.get("location", "")))
-                u = str(s.get("url", "") or "").strip()
-                if u:
-                    u_esc = escape(u)
-                    samples_html.append(f'<li><a href="{u_esc}" target="_blank" rel="noopener">{t}</a> | {c} | {l}</li>')
-                else:
-                    samples_html.append(f"<li>{t} | {c} | {l}</li>")
-            samples_block = "<ul>" + "".join(samples_html) + "</ul>" if samples_html else ""
-            detail_rows.append(
-                f"<tr><td>{detail}</td><td>{count}</td><td>{samples_block}</td></tr>"
-            )
-        table_html = (
-            "<table><thead><tr><th>First fail detail</th><th>Count</th><th>Examples</th></tr></thead><tbody>"
-            + "".join(detail_rows)
-            + "</tbody></table>"
-            if detail_rows
-            else "<div class='muted'>No removals at this step.</div>"
-        )
-        sections_all_hits.append(
-            f"""
-            <section class="card">
-              <h2>{step_name} (all-hits)</h2>
-              <div class="meta">Rows failing this filter: <b>{removed}</b></div>
-              {table_html}
-            </section>
-            """
-        )
-
-    sections_first_fail = []
-    for step in raw_impact.get("detail_breakdown", []):
-        step_name = escape(str(step.get("step", "")))
-        removed = int(step.get("removed", 0) or 0)
-        detail_rows = []
-        for d in step.get("details", []):
-            detail = escape(str(d.get("detail", "")))
-            count = int(d.get("count", 0) or 0)
-            samples_html = []
-            for s in d.get("samples", []):
-                t = escape(str(s.get("title", "")))
-                c = escape(str(s.get("company", "")))
-                l = escape(str(s.get("location", "")))
-                u = str(s.get("url", "") or "").strip()
-                if u:
-                    u_esc = escape(u)
-                    samples_html.append(f'<li><a href="{u_esc}" target="_blank" rel="noopener">{t}</a> | {c} | {l}</li>')
-                else:
-                    samples_html.append(f"<li>{t} | {c} | {l}</li>")
-            samples_block = "<ul>" + "".join(samples_html) + "</ul>" if samples_html else ""
-            detail_rows.append(f"<tr><td>{detail}</td><td>{count}</td><td>{samples_block}</td></tr>")
-        table_html = (
-            "<table><thead><tr><th>First fail detail</th><th>Count</th><th>Examples</th></tr></thead><tbody>"
-            + "".join(detail_rows)
-            + "</tbody></table>"
-            if detail_rows
-            else "<div class='muted'>No removals at this step.</div>"
-        )
-        sections_first_fail.append(
-            f"""
-            <section class="card">
-              <h2>{step_name} (first-fail)</h2>
-              <div class="meta">Rows removed at this stage in sequential funnel: <b>{removed}</b></div>
-              {table_html}
-            </section>
-            """
-        )
-
-    raw_csv = escape(str(raw_impact.get("raw_csv", "")))
-    raw_rows = int(raw_impact.get("raw_rows", 0) or 0)
-    final_rows = int(raw_impact.get("final_after_dedup", 0) or 0)
-    html = f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Raw -> Strict Detailed Report</title>
-  <style>
-    body {{ font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif; background:#f4f7f9; color:#102027; margin:0; }}
-    .wrap {{ max-width: 1200px; margin: 18px auto; padding: 0 14px 28px; }}
-    .card {{ background:#fff; border:1px solid #d9e1e6; border-radius:10px; padding:12px; margin-bottom:12px; }}
-    .meta {{ color:#4f636d; font-size:13px; }}
-    h1 {{ margin:0 0 8px; font-size:22px; }}
-    h2 {{ margin:0 0 6px; font-size:18px; }}
-    table {{ width:100%; border-collapse:collapse; margin-top:8px; font-size:13px; }}
-    th, td {{ border:1px solid #d9e1e6; padding:8px; vertical-align:top; text-align:left; }}
-    th {{ background:#eef5f7; }}
-    ul {{ margin:0; padding-left:18px; }}
-    a {{ color:#005f73; text-decoration:none; }}
-    a:hover {{ text-decoration:underline; }}
-    .muted {{ color:#4f636d; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <section class="card">
-      <h1>Raw -> Strict Detailed Report</h1>
-      <div class="meta">Raw CSV: <code>{raw_csv}</code></div>
-      <div class="meta">Rows raw: <b>{raw_rows}</b> | Final strict after dedup: <b>{final_rows}</b></div>
-      <div class="meta">All-hits view: one row can be counted in multiple filters.</div>
-      <div class="meta">First-fail view: each row counted once at first failing filter in sequential funnel.</div>
-    </section>
-    <section class="card">
-      <h1>All-Hits Breakdown</h1>
-      <div class="meta">Use this to detect ambiguous filters that over-trigger globally.</div>
-    </section>
-    {''.join(sections_all_hits)}
-    <section class="card">
-      <h1>First-Fail Breakdown</h1>
-      <div class="meta">Use this to understand sequential funnel losses stage by stage.</div>
-    </section>
-    {''.join(sections_first_fail)}
-  </div>
-</body>
-</html>
-"""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html, encoding="utf-8")
-
-
-def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel: dict, raw_impact: dict) -> str:
+def build_html(
+    records: list[dict],
+    source_csv: str,
+    filter_impact: dict,
+    funnel: dict,
+    raw_impact: dict,
+    raw_rebuild_command: str,
+) -> str:
     data_json = json.dumps(records, ensure_ascii=False)
     source_csv_json = json.dumps(source_csv, ensure_ascii=False)
     impact_json = json.dumps(filter_impact, ensure_ascii=False)
     funnel_json = json.dumps(funnel, ensure_ascii=False)
     raw_impact_json = json.dumps(raw_impact, ensure_ascii=False)
+    raw_rebuild_command_json = json.dumps(raw_rebuild_command, ensure_ascii=False)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -671,6 +501,16 @@ def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel
       font-size: 12px;
     }}
     .impact-card b {{ color: var(--accent); }}
+    .btn {{
+      padding: 7px 10px;
+      border-radius: 8px;
+      border: 1px solid #b9d7de;
+      background: #ecf7fa;
+      color: #094857;
+      cursor: pointer;
+      font-size: 12px;
+    }}
+    .btn:hover {{ background: #ddf0f5; }}
   </style>
 </head>
 <body>
@@ -718,6 +558,11 @@ def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel
       <div class="tiny muted">From raw Adzuna search to strict final output.</div>
       <div class="impact-grid" id="rawflow"></div>
       <div class="tiny muted" id="rawwhatif"></div>
+      <div class="row" style="margin-top:8px">
+        <button id="rawRebuildBtn" class="btn" type="button">Rebuild raw impact (copy command)</button>
+        <span class="tiny muted" id="rawCmdStatus"></span>
+      </div>
+      <div class="tiny muted" id="rawcmd"></div>
     </div>
     <div class="panel">
       <h1 style="font-size:18px">Filter Impact (Fair Count)</h1>
@@ -732,6 +577,7 @@ def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel
     const IMPACT = {impact_json};
     const FUNNEL = {funnel_json};
     const RAW_IMPACT = {raw_impact_json};
+    const RAW_REBUILD_COMMAND = {raw_rebuild_command_json};
     document.getElementById("source").textContent = SOURCE;
 
     const qEl = document.getElementById("q");
@@ -746,6 +592,9 @@ def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel
     const reasonsEl = document.getElementById("reasons");
     const rawFlowEl = document.getElementById("rawflow");
     const rawWhatIfEl = document.getElementById("rawwhatif");
+    const rawRebuildBtn = document.getElementById("rawRebuildBtn");
+    const rawCmdStatusEl = document.getElementById("rawCmdStatus");
+    const rawCmdEl = document.getElementById("rawcmd");
 
     function esc(s) {{
       return String(s || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
@@ -789,7 +638,7 @@ def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel
       );
 
       if (sortBy === "priority_desc") {{
-        rows.sort((a,b) => (b.priority_score - a.priority_score) || (b.junior_score - a.junior_score));
+        rows.sort((a,b) => (b.priority_score - a.priority_score) || (b.sponsorship_score - a.sponsorship_score) || (b.hiring_likelihood_score - a.hiring_likelihood_score) || (b.junior_score - a.junior_score));
       }} else if (sortBy === "created_desc") {{
         rows.sort((a,b) => String(b.created).localeCompare(String(a.created)));
       }} else if (sortBy === "company_asc") {{
@@ -819,13 +668,14 @@ def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel
         const why = `<div class="sub"><b>Why:</b> ${{esc(r.why || "[]")}}</div>`;
         const years = (r.years_required === "" || r.years_required === null || r.years_required === undefined) ? "n/a" : String(r.years_required);
         const flags = `<div class="sub"><b>Flags:</b> seniority=${{esc(r.seniority_flag || "none")}} | years_required=${{esc(years)}} | internship=${{esc(r.internship_flag || "none")}} | work_mode=${{esc(mode)}}</div>`;
-        const link = r.working_url || r.fetch_used_url || r.canonical_url || r.url || "";
+        // Use source/public URLs first. working/fetch URLs are for diagnostics/scraping.
+        const link = r.source_url || r.url || r.source_canonical_url || r.canonical_url || r.working_url || r.fetch_used_url || "";
         return `
           <div class="panel item">
             <h2>${{esc(r.title)}} </h2>
             <div class="sub">${{esc(r.company)}} | ${{esc(r.location)}} | ${{esc(r.created)}}</div>
             <div>${{recheck}} ${{fetched}} ${{descLenWarning}} ${{remoteB}}</div>
-            <div class="nums">priority=${{r.priority_score}} | junior=${{r.junior_score}} | lang_fit=${{r.language_fit_score}} | combined_len=${{r.combined_len}} | term=${{esc(r.search_term)}}</div>
+            <div class="nums">priority=${{r.priority_score}} | sponsor=${{r.sponsorship_score}} | hire=${{r.hiring_likelihood_score}} | junior=${{r.junior_score}} | lang_fit=${{r.language_fit_score}} | combined_len=${{r.combined_len}} | term=${{esc(r.search_term)}}</div>
             ${{flags}}
             ${{why}}
             ${{reason}}
@@ -879,7 +729,10 @@ def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel
 
     function renderRawImpact() {{
       if (!RAW_IMPACT || !RAW_IMPACT.available) {{
-        rawFlowEl.innerHTML = `<div class="impact-card">Raw impact unavailable (raw CSV missing)</div>`;
+        const reason = RAW_IMPACT && RAW_IMPACT.skipped
+          ? "Raw impact skipped (fast mode)."
+          : "Raw impact unavailable (raw CSV missing).";
+        rawFlowEl.innerHTML = `<div class="impact-card">${{esc(reason)}}</div>`;
         rawWhatIfEl.textContent = "";
         return;
       }}
@@ -891,16 +744,41 @@ def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel
       const whatIf = Array.isArray(RAW_IMPACT.what_if_skip) ? RAW_IMPACT.what_if_skip : [];
       const top = whatIf.filter(x => Number(x.delta_vs_strict || 0) > 0).slice(0, 5);
       const notes = [];
-      notes.push(
-        top.length
-          ? ("What-if (skip one filter) top gains: " + top.map(x => `${{x.step}}:+${{x.delta_vs_strict}}`).join(", "))
-          : "What-if (skip one filter): no positive gain"
-      );
+      if (RAW_IMPACT.analysis_trimmed) {{
+        notes.push("What-if/detailed breakdown removed (non-essential for daily triage).");
+      }} else {{
+        notes.push(
+          top.length
+            ? ("What-if (skip one filter) top gains: " + top.map(x => `${{x.step}}:+${{x.delta_vs_strict}}`).join(", "))
+            : "What-if (skip one filter): no positive gain"
+        );
+      }}
       if (RAW_IMPACT.detail_report_path) {{
         const href = esc(RAW_IMPACT.detail_report_path);
         notes.push(`<a href="${{href}}" target="_blank" rel="noopener">Open detailed stats page</a>`);
       }}
       rawWhatIfEl.innerHTML = notes.join(" | ");
+    }}
+
+    function setupRawCommandButton() {{
+      if (!RAW_REBUILD_COMMAND) {{
+        rawRebuildBtn.disabled = true;
+        rawCmdStatusEl.textContent = "No command available.";
+        return;
+      }}
+      rawCmdEl.textContent = `Command: ${{RAW_REBUILD_COMMAND}}`;
+      rawRebuildBtn.addEventListener("click", async () => {{
+        try {{
+          if (navigator.clipboard && navigator.clipboard.writeText) {{
+            await navigator.clipboard.writeText(RAW_REBUILD_COMMAND);
+            rawCmdStatusEl.textContent = "Command copied. Run it in terminal.";
+          }} else {{
+            rawCmdStatusEl.textContent = "Clipboard unavailable. Copy the command below.";
+          }}
+        }} catch (_e) {{
+          rawCmdStatusEl.textContent = "Copy failed. Copy the command below.";
+        }}
+      }});
     }}
 
     [qEl, statusEl, remoteEl, minScoreEl, sortByEl].forEach(el => {{
@@ -909,6 +787,7 @@ def build_html(records: list[dict], source_csv: str, filter_impact: dict, funnel
     }});
     renderFunnel();
     renderRawImpact();
+    setupRawCommandButton();
     renderImpact();
     render();
   </script>
@@ -930,19 +809,30 @@ def main():
     parser.add_argument(
         "--market",
         default="be",
-        choices=["be", "ch"],
+        choices=SUPPORTED_MARKETS,
         help="Market profile used for location/language counters.",
     )
     parser.add_argument(
         "--ch-focus",
         default="all",
-        choices=["all", "romandie"],
+        choices=SUPPORTED_CH_FOCUS,
         help="CH focus used for location counters.",
     )
     parser.add_argument(
         "--raw-input",
         default="",
         help="Optional raw Adzuna CSV for raw->strict impact panel.",
+    )
+    parser.add_argument(
+        "--raw-impact-mode",
+        default="full",
+        choices=["full", "skip"],
+        help="Raw->strict impact computation mode. Use 'skip' for fast viewer refresh.",
+    )
+    parser.add_argument(
+        "--location-focus",
+        default="",
+        help="Optional location cluster filter (e.g. rabat, casablanca, tanger).",
     )
     parser.add_argument("--no-open", action="store_true", help="Generate HTML only (do not open browser).")
     args = parser.parse_args()
@@ -953,19 +843,61 @@ def main():
         raise SystemExit(f"[VIEWER] No data found in: {args.input}")
 
     records = build_records(df)
+    if args.location_focus:
+        before_focus = len(records)
+        records = [r for r in records if record_matches_location_focus(r, args.location_focus, args.market)]
+        print(
+            f"[VIEWER] Location focus={args.location_focus} matched {len(records)}/{before_focus} rows "
+            f"(market={args.market})"
+        )
+        if not records:
+            raise SystemExit(f"[VIEWER] No records match location focus '{args.location_focus}'")
     impact = compute_independent_filter_impact(records, args.filter_mode)
     funnel = compute_strict_funnel(records)
-    default_raw = get_output_paths(args.market)["adzuna_raw_csv"]
-    raw_impact = compute_raw_to_strict_impact(args.raw_input or default_raw, args.filter_mode)
-    out = Path(args.output)
-    raw_detail_path = out.with_name(f"{out.stem}_raw_strict_details.html")
-    if raw_impact.get("available", False):
-        write_raw_detail_report(raw_impact, raw_detail_path)
-        raw_impact["detail_report_path"] = raw_detail_path.name
+    raw_key = "merged_raw_csv" if args.market == "ma" else "adzuna_raw_csv"
+    default_raw = get_output_paths(args.market)[raw_key]
+    raw_input_path = args.raw_input or default_raw
+    if args.raw_impact_mode == "full":
+        raw_impact = compute_raw_to_strict_impact(raw_input_path, args.filter_mode)
     else:
-        raw_impact["detail_report_path"] = ""
+        # Fast path for post-enrichment refreshes: skip expensive raw->strict replay.
+        raw_impact = {
+            "available": False,
+            "raw_csv": raw_input_path,
+            "steps": [],
+            "final_after_dedup": 0,
+            "what_if_skip": [],
+            "skipped": True,
+            "analysis_trimmed": True,
+        }
+    output_path = location_focus_path(args.output, args.location_focus)
+    out = Path(output_path)
+    raw_impact["detail_report_path"] = ""
 
-    html = build_html(records, args.input, impact, funnel, raw_impact)
+    rebuild_cmd = subprocess.list2cmdline(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--input",
+            args.input,
+            "--output",
+            args.output,
+            "--market",
+            args.market,
+            "--ch-focus",
+            args.ch_focus,
+            "--filter-mode",
+            args.filter_mode,
+            "--raw-input",
+            raw_input_path,
+            "--raw-impact-mode",
+            "full",
+            "--location-focus",
+            args.location_focus,
+            "--no-open",
+        ]
+    )
+    html = build_html(records, args.input, impact, funnel, raw_impact, rebuild_cmd)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")
@@ -979,3 +911,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

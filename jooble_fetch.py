@@ -19,6 +19,7 @@ from config import (
     SUPPORTED_MARKETS,
     get_market_profile,
     get_output_paths,
+    require_jooble_credentials,
     resolve_filter_mode,
 )
 
@@ -128,6 +129,9 @@ def main():
             print(f"[WARN] Fichier brut vide: {jooble_raw_csv}")
             all_jobs = []
     else:
+        if not market_profile.get("supports_jooble", True):
+            raise RuntimeError(f"Jooble fetch is not supported for market '{market}'.")
+        require_jooble_credentials()
         for term in search_terms:
             page_count = PAGES_PER_TERM.get(term, DEFAULT_PAGES)
             print(f"[INFO][Jooble] Searching '{term}' ({page_count} pages)...")

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import unicodedata
 from pathlib import Path
 from typing import Iterable
 
@@ -27,9 +28,172 @@ CLOSED_STATUSES = {"applied", "interview", "offer", "rejected", "withdrawn", "no
 POSITIVE_FEEDBACK_STATUSES = {"interview", "offer"}
 NEGATIVE_FEEDBACK_STATUSES = {"rejected", "not_interested", "withdrawn"}
 
+MA_LOCATION_FOCUS_CLUSTERS = {
+    "rabat": ["rabat", "sale", "sale ", "salé", "technopolis", "skhirat", "temara", "temara", "témara"],
+    "casablanca": ["casablanca", "mohammedia", "bouskoura", "nouaceur", "sidi maarouf", "sidi maârouf"],
+    "tanger": ["tanger", "tangier", "tetouan", "tetouan", "tétouan"],
+    "rabat_or_remote": ["rabat", "sale", "sale ", "salé", "technopolis", "skhirat", "temara", "temara", "témara"],
+}
+
 
 def _normalize_text_key(value: str) -> str:
     return str(value or "").strip().lower()
+
+
+def _normalize_match_text(*values: str) -> str:
+    raw = " ".join(str(v or "") for v in values if str(v or ""))
+    folded = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    return " ".join(folded.lower().split())
+
+
+def resolve_location_focus_terms(location_focus: str, market: str) -> list[str]:
+    focus = _normalize_match_text(location_focus)
+    if not focus:
+        return []
+    if market == "ma" and focus in MA_LOCATION_FOCUS_CLUSTERS:
+        return [_normalize_match_text(token) for token in MA_LOCATION_FOCUS_CLUSTERS[focus]]
+    return [focus]
+
+
+def location_matches_focus(location: str, location_focus: str, market: str, is_remote: bool = False) -> bool:
+    terms = resolve_location_focus_terms(location_focus, market)
+    if not terms:
+        return True
+    if market == "ma" and _normalize_match_text(location_focus) == "rabat_or_remote" and bool(is_remote):
+        return True
+    loc_norm = _normalize_match_text(location)
+    return any(term in loc_norm for term in terms)
+
+
+def location_focus_path(path: str, location_focus: str) -> str:
+    focus = _normalize_match_text(location_focus)
+    if not focus:
+        return path
+    safe_focus = focus.replace(" ", "_")
+    p = Path(path)
+    return str(p.with_name(f"{p.stem}_{safe_focus}{p.suffix}"))
+
+
+MA_NON_TARGET_LANGUAGE_MARKERS = {
+    "nl": ["neerlandais", "nederlands", "dutch", "dutch-speaking"],
+    "de": ["germanophone", "german", "deutsch", "allemand"],
+    "es": ["hispanophone", "hispano", "spanish", "espagnol"],
+    "tr": ["turkish", "turc", "turcophone"],
+    "it": ["italophone", "italien", "italiano"],
+}
+
+MA_FORCE_REVIEW_TITLE_MARKERS = {
+    "product_owner": ["proxy product owner", "product owner"],
+    "app_support": ["support applicatif", "application support"],
+    "customer_service": ["conseiller de clientele", "customer care", "customer service"],
+    "qa_testing": ["testeur", "qa", "quality assurance"],
+    "internship": ["stagiaire", "stage ", " stage", "internship", "intern "],
+}
+
+MA_APPLY_NOW_TITLE_SIGNALS = [
+    "junior infra",
+    "technicien it",
+    "technicien informatique",
+    "technicien en informatique",
+    "technicien support informatique",
+    "technicien reseau",
+    "technicien si",
+    "technicien support",
+    "help desk",
+    "helpdesk",
+    "service desk",
+    "support it",
+    "support technique",
+    "administrateur systeme",
+    "administrateur reseau",
+    "system engineer",
+    "systems engineer",
+    "infrastructure engineer",
+    "network engineer",
+    "network administrator",
+    "devops engineer",
+    "cloud engineer",
+    "platform engineer",
+    "ingenieur reseaux",
+    "ingenieur systeme",
+    "ingenieur systemes d information",
+    "ingenieur infrastructure",
+]
+
+MA_GENERIC_TITLE_MARKERS = [
+    "ingenieur anglophone",
+    "ingenieur francophone",
+    "ingenieur germanophone",
+    "ingenieur hispanophone",
+    "ingenieur italophone",
+    "ingenieur turcophone",
+]
+
+
+def compute_market_queue_adjustment(row: pd.Series, market_profile: dict) -> tuple[int, str, bool]:
+    """
+    Apply market-specific queue penalties without removing rows from the filtered CSV.
+    For Morocco, this is where we demote obvious time-wasters:
+    - extra-language specialist roles outside the target FR/EN/AR set
+    - product/customer-service/test roles that slipped through relevance filters
+    - internships that are not worth an "apply now" slot
+    """
+    market = str(market_profile.get("market", "") or "").strip().lower()
+    if market != "ma":
+        return 0, "", False
+
+    allowed_languages = {str(code or "").strip().lower() for code in market_profile.get("allowed_language_codes", [])}
+    title_norm = _normalize_match_text(row.get("title", ""))
+    text_norm = _normalize_match_text(row.get("title", ""), row.get("description", ""), row.get("company", ""))
+    if not text_norm:
+        return 0, "", False
+
+    penalty = 0
+    reasons: list[str] = []
+    force_review = False
+
+    for code, markers in MA_NON_TARGET_LANGUAGE_MARKERS.items():
+        if code in allowed_languages:
+            continue
+        if any(marker in text_norm for marker in markers):
+            penalty -= 12
+            reasons.append(f"language:{code}")
+            force_review = True
+
+    for reason, markers in MA_FORCE_REVIEW_TITLE_MARKERS.items():
+        if any(marker in title_norm for marker in markers):
+            penalty -= 10
+            reasons.append(reason)
+            force_review = True
+
+    penalty = max(-30, penalty)
+    return penalty, " | ".join(reasons[:4]), force_review
+
+
+def market_apply_now_allowed(row: pd.Series, market_profile: dict) -> tuple[bool, str]:
+    """
+    Gate the small `apply_now` bucket with higher confidence rules.
+    For Morocco, `apply_now` should mean the title itself is clearly on-target,
+    not just that the blended score is high.
+    """
+    market = str(market_profile.get("market", "") or "").strip().lower()
+    if market != "ma":
+        return True, ""
+
+    title_norm = _normalize_match_text(row.get("title", ""))
+    if not title_norm:
+        return False, "empty_title"
+
+    if any(marker in title_norm for marker in MA_GENERIC_TITLE_MARKERS):
+        return False, "generic_language_title"
+
+    if any(signal in title_norm for signal in MA_APPLY_NOW_TITLE_SIGNALS):
+        return True, ""
+
+    if "junior" in title_norm:
+        return True, ""
+
+    return False, "title_not_specific_enough"
 
 
 def _status_outcome_weight(status: str) -> int:
@@ -148,6 +312,10 @@ def build_reason(row: pd.Series, market_profile: dict) -> str:
     if bool(row.get("is_remote", False)):
         reasons.append("remote/hybrid")
 
+    sponsorship = int(float(row.get("sponsorship_score", 0) or 0))
+    if sponsorship > 0:
+        reasons.append("sponsors-visa")
+
     if int(row.get("language_fit_score", 0)) > 0:
         reasons.append("language-fit")
 
@@ -214,6 +382,11 @@ def main():
     )
     parser.add_argument("--input-csv", default="", help="Optional override input CSV path.")
     parser.add_argument("--output-csv", default="", help="Optional override apply queue output CSV.")
+    parser.add_argument(
+        "--location-focus",
+        default="",
+        help="Optional location cluster filter (e.g. rabat, casablanca, tanger).",
+    )
     parser.add_argument("--top-n", type=int, default=20, help="Max jobs to keep in apply queue.")
     parser.add_argument(
         "--min-priority",
@@ -233,7 +406,8 @@ def main():
     paths = get_output_paths(market)
 
     input_csv = args.input_csv or choose_input_csv(paths)
-    output_csv = args.output_csv or focused_path(paths["apply_queue_csv"], market, market_profile["ch_focus"])
+    base_output_csv = args.output_csv or focused_path(paths["apply_queue_csv"], market, market_profile["ch_focus"])
+    output_csv = location_focus_path(base_output_csv, args.location_focus)
     tracker_csv = focused_path(paths["applications_tracker_csv"], market, market_profile["ch_focus"])
 
     jobs = safe_read_csv(input_csv)
@@ -282,6 +456,26 @@ def main():
     jobs["status"] = normalize_status_col(jobs["status"])
     if not args.include_closed:
         jobs = jobs[~jobs["status"].isin(CLOSED_STATUSES)].copy()
+    if args.location_focus:
+        before_focus = len(jobs)
+        jobs = jobs[
+            jobs.apply(
+                lambda row: location_matches_focus(
+                    row.get("location", ""),
+                    args.location_focus,
+                    market,
+                    bool(row.get("is_remote", False)),
+                ),
+                axis=1,
+            )
+        ].copy()
+        print(
+            f"[QUEUE] Location focus={args.location_focus} matched {len(jobs)}/{before_focus} rows "
+            f"(market={market})"
+        )
+        if jobs.empty:
+            print(f"[QUEUE] No jobs found for location focus '{args.location_focus}' in {input_csv}")
+            return
 
     # Apply a light feedback loop from historical outcomes.
     feedback_pairs = jobs.apply(
@@ -292,20 +486,37 @@ def main():
     jobs["feedback_signals"] = feedback_pairs.map(lambda x: x[1])
     if "hiring_likelihood_score" not in jobs.columns:
         jobs["hiring_likelihood_score"] = 0
+    if "sponsorship_score" not in jobs.columns:
+        jobs["sponsorship_score"] = 0
     jobs["priority_score"] = pd.to_numeric(jobs["priority_score"], errors="coerce").fillna(0)
     jobs["hiring_likelihood_score"] = pd.to_numeric(jobs["hiring_likelihood_score"], errors="coerce").fillna(0)
+    jobs["sponsorship_score"] = pd.to_numeric(jobs["sponsorship_score"], errors="coerce").fillna(0)
     jobs["feedback_score"] = pd.to_numeric(jobs["feedback_score"], errors="coerce").fillna(0)
-    jobs["adjusted_priority_score"] = jobs["priority_score"] + jobs["feedback_score"]
+    market_adjustments = jobs.apply(lambda r: compute_market_queue_adjustment(r, market_profile), axis=1)
+    jobs["queue_adjustment"] = market_adjustments.map(lambda x: x[0])
+    jobs["queue_adjustment_reasons"] = market_adjustments.map(lambda x: x[1])
+    jobs["force_review"] = market_adjustments.map(lambda x: x[2])
+    jobs["adjusted_priority_score"] = jobs["priority_score"] + jobs["feedback_score"] + jobs["queue_adjustment"]
 
     jobs["apply_reason"] = jobs.apply(lambda r: build_reason(r, market_profile), axis=1)
-    jobs["recommended_action"] = jobs["adjusted_priority_score"].apply(
-        lambda s: "apply_now" if int(s) >= int(args.min_priority) else "review"
+    apply_now_gates = jobs.apply(lambda r: market_apply_now_allowed(r, market_profile), axis=1)
+    jobs["apply_now_gate_reason"] = apply_now_gates.map(lambda x: x[1])
+    jobs["recommended_action"] = jobs.apply(
+        lambda r: "review"
+        if bool(r.get("force_review", False))
+        or not (
+            int(r.get("adjusted_priority_score", 0)) >= int(args.min_priority)
+            and not str(r.get("apply_now_gate_reason", "") or "")
+        )
+        else "apply_now",
+        axis=1,
     )
 
     sort_cols = [
         c
         for c in [
             "adjusted_priority_score",
+            "sponsorship_score",
             "hiring_likelihood_score",
             "feedback_score",
             "priority_score",
@@ -321,8 +532,12 @@ def main():
         "job_id",
         "recommended_action",
         "adjusted_priority_score",
+        "sponsorship_score",
         "feedback_score",
         "feedback_signals",
+        "queue_adjustment",
+        "queue_adjustment_reasons",
+        "apply_now_gate_reason",
         "hiring_likelihood_score",
         "priority_score",
         "language_fit_score",
@@ -359,3 +574,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

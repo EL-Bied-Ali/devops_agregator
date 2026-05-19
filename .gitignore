@@ -7,7 +7,11 @@ __pycache__/
 *.swo
 *.DS_Store
 
-# Data outputs
-data/*.csv
+# Secrets
 config_secrets.py
 .env
+
+# Data outputs — generated files, never commit job data or cached API responses
+data/*.csv
+data/*.json
+data/*.html

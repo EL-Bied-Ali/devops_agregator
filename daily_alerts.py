@@ -151,26 +151,84 @@ def main():
 
     py = sys.executable
     root = os.path.dirname(os.path.abspath(__file__))
-    filtered_key = "adzuna_filtered_strict_csv" if filter_mode == "strict" else "adzuna_filtered_broad_csv"
+    if market == "ma":
+        filtered_key = "merged_filtered_strict_csv" if filter_mode == "strict" else "merged_filtered_broad_csv"
+    else:
+        filtered_key = "adzuna_filtered_strict_csv" if filter_mode == "strict" else "adzuna_filtered_broad_csv"
     filtered_csv = preferred_existing_path(paths[filtered_key], market, profile["ch_focus"])
     p_filtered = Path(filtered_csv)
     enriched_csv = str(p_filtered.with_name(f"{p_filtered.stem}_enriched{p_filtered.suffix}"))
 
-    adzuna_cmd = [
-        py,
-        os.path.join(root, "adzuna_fetch.py"),
-        "--market",
-        market,
-        "--ch-focus",
-        ch_focus,
-        "--filter-mode",
-        filter_mode,
-    ]
-    if args.no_fetch:
-        adzuna_cmd.append("--no-fetch")
-    run_cmd(adzuna_cmd)
+    if market == "ma":
+        emploi_cmd = [
+            py,
+            os.path.join(root, "emploi_ma_fetch.py"),
+            "--market",
+            market,
+            "--ch-focus",
+            ch_focus,
+            "--filter-mode",
+            filter_mode,
+        ]
+        if args.no_fetch:
+            emploi_cmd.append("--no-fetch")
+        run_cmd(emploi_cmd)
+        rekrute_cmd = [
+            py,
+            os.path.join(root, "rekrute_fetch.py"),
+            "--market",
+            market,
+            "--ch-focus",
+            ch_focus,
+            "--filter-mode",
+            filter_mode,
+        ]
+        if args.no_fetch:
+            rekrute_cmd.append("--no-fetch")
+        run_cmd(rekrute_cmd)
+        marocannonces_cmd = [
+            py,
+            os.path.join(root, "marocannonces_fetch.py"),
+            "--market",
+            market,
+            "--ch-focus",
+            ch_focus,
+            "--filter-mode",
+            filter_mode,
+        ]
+        if args.no_fetch:
+            marocannonces_cmd.append("--no-fetch")
+        run_cmd(marocannonces_cmd)
+        run_cmd(
+            [
+                py,
+                os.path.join(root, "merge_jobs.py"),
+                "--market",
+                market,
+                "--ch-focus",
+                ch_focus,
+                "--filter-mode",
+                filter_mode,
+            ]
+        )
+    else:
+        adzuna_cmd = [
+            py,
+            os.path.join(root, "adzuna_fetch.py"),
+            "--market",
+            market,
+            "--ch-focus",
+            ch_focus,
+            "--filter-mode",
+            filter_mode,
+        ]
+        if args.no_fetch:
+            adzuna_cmd.append("--no-fetch")
+        run_cmd(adzuna_cmd)
 
-    if not args.skip_enrich:
+    if market == "ma":
+        print("[DAILY] Enrichment skipped for market=ma because Emploi.ma fetch already stores full detail pages.")
+    elif not args.skip_enrich:
         enrich_cmd = [
             py,
             os.path.join(root, "enrich_full_descriptions.py"),

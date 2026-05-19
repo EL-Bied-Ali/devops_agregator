@@ -43,6 +43,8 @@ from config import (
     ROLE_FORBIDDEN_KEYWORDS,
     ROLE_REQUIRED_KEYWORDS,
     SPEED_ROLE_TARGETS,
+    SPONSORSHIP_POSITIVE_PHRASES,
+    SPONSORSHIP_NEGATIVE_PHRASES,
     SUPPORTED_CH_FOCUS,
     SUPPORTED_FILTER_MODES,
     SUPPORTED_MARKETS,
@@ -51,15 +53,30 @@ from config import (
     resolve_ch_focus,
     resolve_filter_mode,
     resolve_market,
+    require_adzuna_credentials,
 )
 
 # Title patterns to drop immediately
 DEFAULT_BAD_TITLE_KEYWORDS = [
     "senior",
     "medior",
+    "mid-level",
+    "mid level",
     "principal",
     "expert",
     " l3 ",
+    # Quality Assurance tester roles (not DevOps)
+    "(qa)",
+    # HR / non-IT grad programs
+    "hr graduate",
+    "it analyst graduate",
+    # Staff Engineer = L6+ (senior level) at most tech companies
+    " staff ",
+    "staff engineer",
+    "staff platform",
+    "staff sre",
+    # "Sr." is abbreviated "Senior"
+    "sr. ",
 ]
 BAD_TITLE_KEYWORDS = DEFAULT_BAD_TITLE_KEYWORDS + list(EXTRA_BAD_TITLE_KEYWORDS)
 
@@ -82,6 +99,10 @@ EXCLUDE_EXCEPTIONS = [
     "vergelijkbare vacatures senior",
     "user hardware",
     "hardware and peripherals",
+    "grow into senior",
+    "path into senior",
+    "escalate to senior",
+    "work with senior",
 ]
 
 # Leadership/seniority words that should only hard-block when present in title.
@@ -97,6 +118,28 @@ TITLE_ONLY_EXCLUDE = {
     "team lead",
     "tech lead",
 }
+
+SENIOR_TITLE_TRIGGER_RE = re.compile(r"\b(senior|sr\.?|lead|principal)\b", flags=re.I)
+SENIOR_ROLE_CONTEXT_RE = re.compile(
+    # Classic "senior near role/position" patterns
+    r"\bsenior\b(?:\W+\w+){0,8}\W+\b(role|position|post|function)\b"
+    r"|\b(role|position|post|function)\b(?:\W+\w+){0,8}\W+\bsenior\b"
+    # "Two/multiple senior X" → clearly hiring seniors
+    r"|\b(two|2|three|3|multiple|several)\s+senior\b"
+    # "Senior X needed/required/sought" (within 5 words)
+    r"|\bsenior\b(?:\W+\w+){0,5}\W+\b(needed|required|sought|wanted)\b"
+    # "looking for / seeking / hiring ... senior" (within 8 words)
+    r"|\b(looking\s+for|looking\s+to\s+bring\s+in|seeking|we\s+are\s+hiring)\b(?:\W+\w+){0,8}\W+\bsenior\b"
+    # Slash-separated senior titles: "Senior X / Senior Y" in description
+    r"|\bsenior\b\s+\w+(?:\s+\w+)?\s*/\s*senior\b",
+    flags=re.I,
+)
+SENIOR_IGNORE_CONTEXT_PATTERNS = [
+    r"\bgrow\s+into\s+senior\b",
+    r"\bpath\s+into\s+senior\b",
+    r"\bescalat\w*\s+to\s+senior\b",
+    r"\bwork\w*\s+with\s+senior\b",
+]
 
 ACTIVE_MARKET = ""
 ACTIVE_CH_FOCUS = "all"
@@ -460,6 +503,17 @@ def is_remote_job(title: str, desc: str, loc: str) -> bool:
 
 def location_ok(loc: str, title: str = "", desc: str = "") -> bool:
     """Return True if location is acceptable for the active market."""
+    # Always check blocked location keywords first, regardless of enforce_location_filter.
+    # This prevents jobs in clearly foreign cities (e.g. Cluj for DE market) from slipping
+    # through when enforce_location_filter is False.
+    # Also check the job TITLE — companies sometimes embed the real work city in the title
+    # (e.g. "DevOps Engineer — Cluj") while listing a German HQ address in the location field.
+    blocked_keywords = ACTIVE_MARKET_PROFILE.get("blocked_location_keywords", [])
+    if blocked_keywords:
+        check_text = normalize(f"{loc or ''} {title or ''}")
+        if any(normalize(kw) in check_text for kw in blocked_keywords):
+            return False
+
     if ACTIVE_MARKET == "ch" and is_remote_job(title, desc, loc):
         combined = normalize(f"{loc or ''} {title or ''} {desc or ''}")
         foreign_keywords = ACTIVE_MARKET_PROFILE.get("foreign_location_keywords", [])
@@ -550,6 +604,29 @@ def title_has_lead_or_manager(title: str) -> bool:
     return any(keyword_hit(title_norm, marker, boundary_only=True) for marker in LEAD_TITLE_MARKERS)
 
 
+def _senior_keyword_is_contextual_exclude(title: str, text: str, years_required: int | None) -> bool:
+    """
+    Decide if `senior` should count as an exclude hit.
+    Avoid false positives from growth/escalation wording in descriptions.
+    """
+    raw_title = str(title or "")
+    text_norm = normalize_text(text or "")
+
+    if SENIOR_TITLE_TRIGGER_RE.search(raw_title):
+        return True
+    if years_required is not None and years_required >= 5:
+        return True
+
+    role_context = SENIOR_ROLE_CONTEXT_RE.search(text_norm) is not None
+    if role_context:
+        return True
+
+    for pat in SENIOR_IGNORE_CONTEXT_PATTERNS:
+        if re.search(pat, text_norm):
+            return False
+    return False
+
+
 def classify_excluded_hits(title: str, text: str) -> tuple[list[str], list[str]]:
     """
     Split exclude hits into hard vs soft.
@@ -559,9 +636,16 @@ def classify_excluded_hits(title: str, text: str) -> tuple[list[str], list[str]]
     if not hits:
         return [], []
 
+    years_required: int | None = None
+    if any(normalize_text(h) == "senior" for h in hits):
+        _exp_level, _exp_detail, years_required = detect_experience_requirement_details(title, text)
+
     hard_hits: list[str] = []
     soft_hits: list[str] = []
     for hit in hits:
+        hit_norm = normalize_text(hit)
+        if hit_norm == "senior" and not _senior_keyword_is_contextual_exclude(title, text, years_required):
+            continue
         if normalize_text(hit) in TITLE_ONLY_EXCLUDE and not keyword_match(title, hit):
             soft_hits.append(hit)
         else:
@@ -606,6 +690,15 @@ def run_exclude_keyword_self_tests():
     print(
         f"[SELFTEST] architecture vs architect => hard={hard_4} soft={soft_4} "
         f"expected=no architect hit | {'PASS' if pass_4 else 'FAIL'}"
+    )
+
+    title_5 = "Junior Project Manager - Talent Program"
+    desc_5 = "You will grow into senior roles and may escalate to senior staff when needed."
+    hard_5, soft_5 = classify_excluded_hits(title_5, f"{title_5} {desc_5}")
+    pass_5 = "senior" not in [normalize_text(x) for x in (hard_5 + soft_5)]
+    print(
+        f"[SELFTEST] senior growth/escalation context => hard={hard_5} soft={soft_5} "
+        f"expected=no senior hit | {'PASS' if pass_5 else 'FAIL'}"
     )
 
 
@@ -684,6 +777,33 @@ def run_self_checks():
         need_7["english_only"] and blocked_language_requirement_reason(case_7, "strict") == "",
     )
 
+    # 7b) Luminus-like "Dutch and/or French" must not hard-block Dutch.
+    case_7b = "Required languages: Dutch and/or French and English."
+    dutch_7b = detect_dutch_requirement(case_7b, "")
+    check(
+        "Dutch and/or French => not dutch_required",
+        (not dutch_7b["required"]) and blocked_language_requirement_reason(case_7b, "strict") == "",
+        f"dutch={dutch_7b}",
+    )
+
+    # 7c) Dutch plus should never be treated as required.
+    case_7c = "English required. Dutch is a plus."
+    dutch_7c = detect_dutch_requirement(case_7c, "")
+    check(
+        "Dutch is a plus => not required",
+        (not dutch_7c["required"]) and blocked_language_requirement_reason(case_7c, "strict") == "",
+        f"dutch={dutch_7c}",
+    )
+
+    # 7d) Dutch OR willingness to learn Dutch mandatory => manual-review only.
+    case_7d = "Dutch or willingness to learn Dutch is mandatory."
+    dutch_7d = detect_dutch_requirement(case_7d, "")
+    check(
+        "Dutch or willingness to learn => manual review reason",
+        (not dutch_7d["required"]) and language_manual_review_reason(case_7d) == "language_alternative:dutch_preferred_or_learn",
+        f"dutch={dutch_7d} review={language_manual_review_reason(case_7d)}",
+    )
+
     # 8) 2-3 years + junior should not hard block.
     title_8 = "Junior Cloud Engineer"
     desc_8 = "2-3 years experience in Linux and cloud. Training provided."
@@ -717,6 +837,26 @@ def run_self_checks():
         "5+ years => hard block",
         lvl_10 == "hard",
         f"level={lvl_10} detail={detail_10} years={years_10}",
+    )
+
+    # 10b) Wide range with low minimum should not hard-block.
+    title_10b = "Cloud Engineer"
+    desc_10b = "1-7 years of experience accepted."
+    lvl_10b, detail_10b, years_10b = detect_experience_requirement_details(title_10b, desc_10b)
+    check(
+        "1-7 years => no hard block",
+        lvl_10b != "hard" and years_10b == 1,
+        f"level={lvl_10b} detail={detail_10b} years={years_10b}",
+    )
+
+    # 10c) Technical token "stage_live" should not trigger internship detection.
+    title_10c = "DevOps Engineer"
+    desc_10c = "<div class='stage_live'>deploy pipeline</div><script>var stage_live=true;</script>"
+    detail_10c = internship_generic_detail(title_10c, desc_10c)
+    check(
+        "stage_live token => no internship flag",
+        detail_10c == "",
+        f"detail={detail_10c}",
     )
 
     # 11) Hiring likelihood should prefer junior-friendly copy.
@@ -861,6 +1001,165 @@ ENGLISH_ONLY_PATTERNS = [
     r"\benglish\s+required\b",
     r"\brequired\s+english\b",
 ]
+
+# Strong Dutch requirement signals only (used to avoid NL false positives).
+DUTCH_TITLE_REQUIRED_PATTERNS = [
+    r"\bdutch[\s-]?speaking\b",
+    r"\bnederlandstalig\b",
+]
+DUTCH_REQUIRED_STRONG_PATTERNS = [
+    r"\bdutch\s+is\s+(?:mandatory|required|essential)\b",
+    r"\bdutch\s+(?:mandatory|required|essential)\b",
+    r"\bfluency\s+in\s+dutch\s+is\s+required\b",
+    r"\bmust\s+be\s+fluent\s+in\s+dutch\b",
+    r"\bmust\s+speak\s+dutch\b",
+    r"\bdutch\s+c1\b",
+    r"\bexcellent\s+command\s+of\s+dutch\b",
+    r"\bdutch[-\s]?speaking\s+required\b",
+    r"\bknowledge\s+of\s+dutch\s+is\s+mandatory\b",
+    r"\bnederlands\s+verplicht\b",
+    r"\bnederlands\s+is\s+verplicht\b",
+    r"\bnederlands\s+vereist\b",
+    r"\bneerlandais\s+(?:obligatoire|requis)\b",
+    r"\bbonne\s+maitrise\s+du\s+neerlandais\b",
+    r"\bbonne\s+maitrise\s+du\s+francais\s+et\s+du\s+neerlandais\b",
+    r"\btrilingual\b(?:\W+\w+){0,8}\W+\bdutch\b",
+    r"\btrilingual\b(?:\W+\w+){0,8}\W+\bneerlandais\b",
+    r"\btrilingue\b(?:\W+\w+){0,8}\W+\bneerlandais\b",
+]
+DUTCH_ALTERNATIVE_PATTERNS = [
+    r"\bdutch\s+and\s*/?\s*or\s+french\b",
+    r"\bfrench\s+and\s*/?\s*or\s+dutch\b",
+    r"\bdutch\s+or\s+french\b",
+    r"\bfrench\s+or\s+dutch\b",
+    r"\bdutch\s*/\s*french\b",
+    r"\bfrench\s*/\s*dutch\b",
+]
+DUTCH_PLUS_PATTERNS = [
+    r"\bdutch\s+is\s+a\s+plus\b",
+    r"\bdutch\s+would\s+be\s+a\s+plus\b",
+    r"\bnice\s+to\s+have\s+dutch\b",
+    r"\bdutch\s+is\s+a\s+nice\s+to\s+have\b",
+    r"\bdutch\s+is\s+an\s+asset\b",
+    r"\bknowledge\s+of\s+dutch\s+is\s+a\s+plus\b",
+    r"\bnederlands\s+is\s+een\s+plus\b",
+    r"\bneerlandais\s+est\s+un\s+(?:plus|atout)\b",
+]
+DUTCH_PREFERRED_OR_LEARN_PATTERNS = [
+    r"\bdutch\s+or\s+willing\w*\s+to\s+learn\s+dutch\s+(?:is\s+)?mandatory\b",
+]
+DUTCH_REQUIRED_CONTEXT_RE = re.compile(
+    r"\b(?:dutch|nederlands|neerlandais)\b(?:\W+\w+){0,5}\W+"
+    r"\b(?:required|mandatory|essential|must|verplicht|vereist|obligatoire|requis|c1|fluent)\b"
+    r"|\b(?:required|mandatory|essential|must|verplicht|vereist|obligatoire|requis|c1|fluent)\b"
+    r"(?:\W+\w+){0,5}\W+\b(?:dutch|nederlands|neerlandais)\b",
+    flags=re.I,
+)
+
+
+def _first_matching_pattern(text_norm: str, patterns: list[str]) -> str:
+    for pat in patterns:
+        if re.search(pat, text_norm):
+            return pat
+    return ""
+
+
+def detect_dutch_requirement(text: str, title: str = "") -> dict:
+    """
+    Detect Dutch requirement with conservative/high-confidence rules.
+    Returns:
+      {
+        "required": bool,
+        "confidence": float,
+        "evidence": str,
+      }
+    """
+    text_norm = normalize_text(text or "")
+    title_norm = normalize_text(title or "")
+    combined = " ".join(part for part in [title_norm, text_norm] if part).strip()
+    if not combined:
+        return {
+            "required": False,
+            "confidence": 0.0,
+            "evidence": "",
+            "alternative": False,
+            "preferred_plus": False,
+            "preferred_or_learn": False,
+        }
+
+    title_match = _first_matching_pattern(title_norm, DUTCH_TITLE_REQUIRED_PATTERNS)
+    if title_match:
+        return {
+            "required": True,
+            "confidence": 0.99,
+            "evidence": f"title:{title_match}",
+            "alternative": False,
+            "preferred_plus": False,
+            "preferred_or_learn": False,
+        }
+
+    learn_match = _first_matching_pattern(combined, DUTCH_PREFERRED_OR_LEARN_PATTERNS)
+    if learn_match:
+        return {
+            "required": False,
+            "confidence": 0.65,
+            "evidence": f"learn:{learn_match}",
+            "alternative": False,
+            "preferred_plus": False,
+            "preferred_or_learn": True,
+        }
+
+    strong_match = _first_matching_pattern(combined, DUTCH_REQUIRED_STRONG_PATTERNS)
+    if strong_match:
+        return {
+            "required": True,
+            "confidence": 0.95,
+            "evidence": f"required:{strong_match}",
+            "alternative": False,
+            "preferred_plus": False,
+            "preferred_or_learn": False,
+        }
+
+    alt_match = _first_matching_pattern(combined, DUTCH_ALTERNATIVE_PATTERNS)
+    if alt_match:
+        return {
+            "required": False,
+            "confidence": 0.15,
+            "evidence": f"alternative:{alt_match}",
+            "alternative": True,
+            "preferred_plus": False,
+            "preferred_or_learn": False,
+        }
+
+    plus_match = _first_matching_pattern(combined, DUTCH_PLUS_PATTERNS)
+    if plus_match:
+        return {
+            "required": False,
+            "confidence": 0.1,
+            "evidence": f"plus:{plus_match}",
+            "alternative": False,
+            "preferred_plus": True,
+            "preferred_or_learn": False,
+        }
+
+    if DUTCH_REQUIRED_CONTEXT_RE.search(combined):
+        return {
+            "required": True,
+            "confidence": 0.8,
+            "evidence": "required:context_window",
+            "alternative": False,
+            "preferred_plus": False,
+            "preferred_or_learn": False,
+        }
+
+    return {
+        "required": False,
+        "confidence": 0.0,
+        "evidence": "",
+        "alternative": False,
+        "preferred_plus": False,
+        "preferred_or_learn": False,
+    }
 
 
 def _extract_language_codes(text_norm: str) -> set[str]:
@@ -1016,16 +1315,28 @@ def classify_language_need(text: str) -> dict:
     """
     norm = normalize_text(text or "")
     parsed = _parse_language_signals(norm)
+    dutch_req = detect_dutch_requirement(text, "")
     required = set(parsed.get("required_langs", set()))
     optional = set(parsed.get("optional_langs", set()))
     alternative_langs = set(parsed.get("alternative_langs", set()))
     blocked_codes = set(ACTIVE_MARKET_PROFILE.get("blocked_language_codes", []))
 
-    requires_dutch = "nl" in required
+    # Override Dutch decision with conservative detector to reduce false positives.
+    if dutch_req.get("required", False):
+        required.add("nl")
+        optional.discard("nl")
+    else:
+        required.discard("nl")
+        if dutch_req.get("preferred_plus", False) or dutch_req.get("preferred_or_learn", False):
+            optional.add("nl")
+
+    requires_dutch = bool(dutch_req.get("required", False))
     prefers_dutch = ("nl" in optional) and not requires_dutch
 
     # FR/NL alternatives are acceptable for this profile because French is available.
     acceptable_without_dutch = False
+    if dutch_req.get("alternative", False):
+        acceptable_without_dutch = True
     if parsed.get("alternative_language_option") and {"fr", "nl"}.issubset(alternative_langs):
         acceptable_without_dutch = True
     if any(re.search(pattern, norm) for pattern in ACCEPTABLE_FR_NL_ALTERNATIVE_PATTERNS):
@@ -1040,8 +1351,12 @@ def classify_language_need(text: str) -> dict:
     requires_blocked_language = len(blocked_required) > 0 and not acceptable_without_dutch
 
     signals = list(parsed.get("evidence", []))
+    if dutch_req.get("evidence"):
+        signals.append(f"dutch_signal:{dutch_req.get('evidence')}")
     if prefers_dutch:
         signals.append("dutch_preferred_not_required")
+    if dutch_req.get("preferred_or_learn", False):
+        signals.append("dutch_preferred_or_learn")
     if acceptable_without_dutch:
         signals.append("fr_or_nl_alternative")
     if english_only and not requires_dutch:
@@ -1061,6 +1376,9 @@ def classify_language_need(text: str) -> dict:
         "english_only": english_only,
         "alternative_language_option": bool(parsed.get("alternative_language_option")),
         "alternative_langs": alternative_langs,
+        "dutch_requirement_confidence": float(dutch_req.get("confidence", 0.0)),
+        "dutch_requirement_evidence": str(dutch_req.get("evidence", "") or ""),
+        "dutch_preferred_or_learn": bool(dutch_req.get("preferred_or_learn", False)),
     }
 
 
@@ -1070,6 +1388,8 @@ def blocked_language_requirement_reason(text: str, filter_mode: str = "strict") 
     # In broad mode we keep those rows and rely on downstream flags/manual checks.
     mode = resolve_filter_mode(filter_mode, allow_both=False) if filter_mode else "strict"
     if mode == "broad":
+        return ""
+    if need.get("dutch_preferred_or_learn", False):
         return ""
 
     blocked_required = set(need.get("blocked_required_langs", []))
@@ -1085,6 +1405,8 @@ def blocked_language_requirement_reason(text: str, filter_mode: str = "strict") 
 
 def language_manual_review_reason(text: str) -> str:
     need = classify_language_need(text)
+    if need.get("dutch_preferred_or_learn", False):
+        return "language_alternative:dutch_preferred_or_learn"
     alt_langs = set(need.get("alternative_langs", set()))
     if need.get("alternative_language_option") and alt_langs.intersection({"nl", "de"}):
         if alt_langs.intersection({"fr"}):
@@ -1121,6 +1443,7 @@ INTERNSHIP_AGREEMENT_MARKERS = [
     "internship agreement",
     "convention de stage",
     "stage agreement",
+    "school contract",
 ]
 
 INTERNSHIP_STUDENT_ONLY_MARKERS = [
@@ -1147,6 +1470,15 @@ INTERNSHIP_INTERN_MARKERS = [
     "internship",
     "intern",
 ]
+
+INTERNSHIP_TECH_TOKEN_PATTERNS = [
+    r"\bstage[_-]?live\b",
+    r"\bstage[_-]env\b",
+    r"\bstaging\b",
+    r"\bgtm\b",
+]
+INTERNSHIP_STAGE_TOKEN_RE = re.compile(r"(?<![a-z0-9_])(stage|stagiaire)(?![a-z0-9_])", flags=re.I)
+INTERNSHIP_INTERN_TOKEN_RE = re.compile(r"(?<![a-z0-9_])(internship|intern)(?![a-z0-9_])", flags=re.I)
 
 EXPERIENCE_JUNIOR_TITLE_MARKERS = [
     "junior",
@@ -1235,6 +1567,7 @@ def _extract_years_required(text_norm: str) -> tuple[int | None, str, bool]:
     candidates: list[tuple[int, str, bool]] = []
     max_reasonable_years = 15
 
+    range_spans: list[tuple[int, int]] = []
     for pattern in EXPERIENCE_RANGE_PATTERNS:
         for match in re.finditer(pattern, text_norm):
             start = int(match.group("start"))
@@ -1245,10 +1578,15 @@ def _extract_years_required(text_norm: str) -> tuple[int | None, str, bool]:
                 continue
             if _near_experience_context(text_norm, match.start(), match.end()):
                 token = re.sub(r"\s+", " ", match.group(0)).strip()
-                candidates.append((end, token, True))
+                # Ranges are interpreted by their lower bound for seniority filtering.
+                candidates.append((start, token, True))
+                range_spans.append((match.start(), match.end()))
 
     for pattern in EXPERIENCE_YEARS_PATTERNS:
         for match in re.finditer(pattern, text_norm):
+            if any(not (match.end() <= s or match.start() >= e) for s, e in range_spans):
+                # Avoid extracting "7 years" from "1-7 years" after range parse.
+                continue
             years = int(match.group("years"))
             if years > max_reasonable_years:
                 continue
@@ -1266,11 +1604,26 @@ def _extract_years_required(text_norm: str) -> tuple[int | None, str, bool]:
     return years_required, detail or f"{years_required}+ years", is_range
 
 
+def internship_matching_text(title: str, desc: str) -> str:
+    """
+    Build a cleaned text stream for internship detection.
+    HTML/script/style/class noise is removed, then known technical tokens are stripped.
+    """
+    clean_title = rule_plain_text(title or "")
+    clean_desc = rule_plain_text(desc or "")
+    text_norm = normalize_text(f"{clean_title} {clean_desc}")
+    if not text_norm:
+        return ""
+    for pat in INTERNSHIP_TECH_TOKEN_PATTERNS:
+        text_norm = re.sub(pat, " ", text_norm)
+    return re.sub(r"\s+", " ", text_norm).strip()
+
+
 def internship_student_only_detail(title: str, desc: str) -> str:
     """
     Return blocking detail for student-only internships, else empty string.
     """
-    text = normalize((title or "") + " " + (desc or ""))
+    text = internship_matching_text(title, desc)
     if not text:
         return ""
 
@@ -1293,7 +1646,7 @@ def internship_generic_detail(title: str, desc: str) -> str:
     """
     Return manual-review detail for generic internship wording (not explicit student-only).
     """
-    text = normalize((title or "") + " " + (desc or ""))
+    text = internship_matching_text(title, desc)
     if not text:
         return ""
 
@@ -1303,10 +1656,10 @@ def internship_generic_detail(title: str, desc: str) -> str:
     if internship_student_only_detail(title, desc):
         return ""
 
-    if any(keyword_hit(text, marker, boundary_only=True) for marker in INTERNSHIP_STAGE_MARKERS):
+    if INTERNSHIP_STAGE_TOKEN_RE.search(text):
         return "stage_keyword"
 
-    if any(keyword_hit(text, marker, boundary_only=True) for marker in INTERNSHIP_INTERN_MARKERS):
+    if INTERNSHIP_INTERN_TOKEN_RE.search(text):
         return "internship_keyword"
 
     return ""
@@ -1421,6 +1774,7 @@ def is_dutch(text: str) -> bool:
 def training_program_relevant(title: str, desc: str) -> bool:
     """Allow trainee/graduate programs only when they look CS/IT-related."""
     text = normalize((title or "") + " " + (desc or ""))
+    title_norm = normalize(title or "")
     training_markers = [
         "graduate",
         "trainee",
@@ -1432,28 +1786,49 @@ def training_program_relevant(title: str, desc: str) -> bool:
         "entry level",
         "formation",
     ]
+    # Unambiguous DevOps/cloud/infra terms - excludes generic words like
+    # "it" (English pronoun), "system", "infrastructure", "support" which
+    # match non-IT job descriptions (Kier highways, medical, banking).
     cs_markers = [
-        "it",
         "ict",
         "computer",
         "informatique",
         "informaticien",
         "informatiker",
         "cloud",
-        "system",
         "linux",
-        "network",
+        "kubernetes",
+        "docker",
+        "terraform",
+        "ansible",
+        "devops",
+        "network engineer",
+        "network administrator",
+        "system administrator",
+        "sysadmin",
+        "platform engineer",
+        "sre",
+        "site reliability",
         "application support",
         "helpdesk",
         "service desk",
-        "support",
-        "platform",
-        "devops",
-        "infrastructure",
+        "ci/cd",
+        "cicd",
+        "aws",
+        "azure",
+        "gcp",
+    ]
+    # Clear IT title signals that override the strict desc requirement
+    it_title_signals = [
+        "cloud", "linux", "devops", "platform", "sre", "ict", "network", "infrastructure engineer",
+        "system administrator", "systems administrator", "it support", "it infrastructure",
     ]
     has_training_marker = any(keyword_hit(text, marker, boundary_only=True) for marker in training_markers)
-    has_cs_marker = any(keyword_hit(text, marker, boundary_only=True) for marker in cs_markers)
-    return has_training_marker and has_cs_marker
+    if not has_training_marker:
+        return False
+    if any(keyword_hit(title_norm, sig, boundary_only=True) for sig in it_title_signals):
+        return True
+    return any(keyword_hit(text, marker, boundary_only=True) for marker in cs_markers)
 
 
 ROLE_TITLE_FALLBACK_KEYWORDS = [
@@ -1563,6 +1938,116 @@ ROLE_ALIAS_INDUSTRIAL_BLOCKERS = [
     "electrical",
     "automation industrielle",
     "industrial automation",
+    # Railway / transport systems (non-IT)
+    "ertms",
+    "etcs",
+    "railway signalling",
+    "railway signaling",
+    "train control",
+    "rolling stock",
+    "railway system",
+    # Defence / military (signals often too short in truncated desc)
+    "electronic warfare",
+    "radar system",
+    "rf system",
+    "radio frequency",
+    # Science / lab (non-IT)
+    "lims",
+    "laboratory information",
+    "satellite payload",
+    "modelling and simulation",
+    # Automotive / mechanical
+    "chassis control",
+    "chassis engineer",
+    "automotive r&d",
+    "powertrain",
+    # US defense / government (Booz Allen Hamilton type)
+    "u.s. federal government",
+    "us federal government",
+    "cross domain solution",
+    "cross domain solutions",
+    "government clearance",
+    # Semiconductor equipment (Applied Materials, ASML field service)
+    "materials engineering solution",
+    "chip-making equipment",
+    "semiconductor equipment",
+    # Chemical / plastics industrial (Trinseo type)
+    "production of plastics",
+    "latex binders",
+    "plastics and latex",
+    # Warehouse / supply chain automation (Kramp type)
+    "warehouse automation engineer",
+    "operational strategies for various projects within",
+]
+
+# Non-IT technical domains blocked at TITLE level before any keyword check.
+# These catch false positives that survive because truncated descriptions
+# don't contain the industrial signal.
+TITLE_DOMAIN_BLOCKERS = [
+    "electronic warfare",
+    "ertms",
+    "etcs",
+    "railway",
+    "train control",
+    "train operation",
+    "rolling stock",
+    "rf system",
+    "radio frequency",
+    "rf test",
+    "rf analysis",
+    # Physical datacenter tech (not DevOps engineering)
+    "critical environment technician",
+    "data center technician",
+    "datacenter technician",
+    "data centre technician",
+    # Non-IT specialist roles that slip through
+    "safety specialist",
+    "safety engineer",
+    "visiting growth",
+    "growth associate",
+    # Supply chain / non-IT
+    "supply chain engineering",
+    "supply chain engineer",
+    # High frequency trading (needs specialized finance background)
+    "high frequency trading",
+    "high-frequency trading",
+    "satellite payload",
+    "modelling and simulation",
+    "lims",
+    "laboratory system",
+    # Automotive / mechanical
+    "chassis",
+    "powertrain",
+    "embedded control",
+    "functional safety",
+    # Civil / structural engineering (not IT)
+    "civil/structural",
+    "structural infrastructure",
+    "civil infrastructure engineer",
+    # Industrial / warehouse automation (not DevOps)
+    "warehouse automation",
+    # Backend developer roles tagged as DevOps in parentheses
+    "back end engineer",
+    "backend engineer",
+    # Medical / clinical (non-IT graduate programs)
+    "clinical graduate",
+    "clinical engineer",
+    "clinical specialist",
+    # Gaming QA (not DevOps security)
+    "game security",
+    "game engineer",
+    # Telecom RAN / radio access network (not cloud/DevOps)
+    "ran network",
+    "ran engineer",
+    "radio access network",
+    # C++ build systems (not DevOps)
+    "c++ ecosystem",
+    "build engineer c++",
+    # Finance graduate programs (not IT roles)
+    "investments & banking",
+    "investment & banking",
+    # Telecom site planning (Huawei Site Design = cell tower location planning)
+    "site design engineer",
 ]
 
 # Strong role signals we trust when present in the title.
@@ -1603,6 +2088,132 @@ ROLE_DESC_INFRA_EVIDENCE = [
     "helm",
     "prometheus",
 ]
+
+IT_TRACK_RULES = [
+    (
+        "infra_ops",
+        [
+            "devops",
+            "sre",
+            "platform",
+            "cloud engineer",
+            "cloud operations",
+            "system administrator",
+            "administrateur systeme",
+            "administrateur reseau",
+            "network engineer",
+            "system engineer",
+            "infrastructure",
+            "it support",
+            "support informatique",
+            "service desk",
+            "helpdesk",
+            "technicien it",
+            "technicien informatique",
+            "technicien support",
+            "technicien si",
+            "systems d information",
+            "systemes d information",
+            "monitoring",
+            "production",
+            "exploitation",
+            "noc",
+        ],
+    ),
+    (
+        "web_backend",
+        [
+            "software engineer",
+            "software developer",
+            "full stack",
+            "fullstack",
+            "backend",
+            "frontend",
+            "web developer",
+            "developpeur",
+            "concepteur developpeur",
+            "java",
+            "python",
+            ".net",
+            "dotnet",
+            "php",
+            "angular",
+            "react",
+            "node.js",
+            "nodejs",
+            "spring",
+        ],
+    ),
+    (
+        "data_ai",
+        [
+            "data engineer",
+            "data analyst",
+            "data scientist",
+            "business intelligence",
+            "power bi",
+            "etl",
+            "sql",
+            "machine learning",
+            "ml engineer",
+            "ai engineer",
+            "ingenieur ia",
+            "big data",
+        ],
+    ),
+    (
+        "qa_test",
+        [
+            "qa engineer",
+            "qa tester",
+            "test engineer",
+            "test analyst",
+            "test automation",
+            "automation qa",
+            "test lead",
+            "validation engineer",
+            "testeur",
+        ],
+    ),
+    (
+        "business_apps",
+        [
+            "sap",
+            "oracle cloud erp",
+            "dynamics 365",
+            "jira service management",
+            "atlassian",
+            "service management",
+            "as400",
+            "sage x3",
+        ],
+    ),
+]
+
+IT_TRACK_PRIORITY_BONUS = {
+    "infra_ops": 2,
+    "web_backend": 1,
+    "data_ai": 1,
+    "qa_test": 1,
+    "business_apps": 0,
+    "other_it": 0,
+}
+
+
+def infer_it_track(title: str, desc: str) -> tuple[str, list[str]]:
+    """
+    Tag broad IT family so the user can widen the search without losing structure.
+    The rules are intentionally simple and title-biased.
+    """
+    text = normalize_text(f"{title or ''} {desc or ''}")
+    hits: list[str] = []
+    if not text:
+        return "other_it", hits
+    for track, patterns in IT_TRACK_RULES:
+        local_hits = [pattern for pattern in patterns if keyword_hit(text, pattern, boundary_only=True)]
+        if local_hits:
+            return track, local_hits[:4]
+    return "other_it", hits
 
 
 def role_title_fallback_relevant(title: str) -> bool:
@@ -1663,9 +2274,12 @@ def _required_keywords_match_reliably(title: str, desc: str) -> bool:
     if not required_hits:
         return False
 
-    # Any required keyword explicitly in title is a strong positive signal.
+    # Any required keyword explicitly in title is a strong positive signal,
+    # unless the description reveals a non-IT technical domain.
     if any(keyword_hit(title_norm, kw, boundary_only=True) for kw in required_hits):
-        return True
+        has_industrial_noise = any(keyword_hit(desc_norm, bad, boundary_only=True) for bad in ROLE_ALIAS_INDUSTRIAL_BLOCKERS)
+        if not has_industrial_noise:
+            return True
 
     # Description-only matches are accepted only when they look truly infra-focused.
     has_infra_evidence = any(keyword_hit(desc_norm, sig, boundary_only=True) for sig in ROLE_DESC_INFRA_EVIDENCE)
@@ -1794,6 +2408,11 @@ def role_forbidden_reason(title: str, desc: str) -> str:
 def role_relevant(title: str, desc: str) -> bool:
     """Keep infra / cloud / devops roles, drop forbidden ones."""
     text = normalize_text((title or "") + " " + (desc or ""))
+    title_norm = normalize_text(title or "")
+
+    # Block non-IT technical domains by title before any keyword check.
+    if any(kw in title_norm for kw in TITLE_DOMAIN_BLOCKERS):
+        return False
 
     if role_forbidden_reason(title, desc):
         return False
@@ -2025,6 +2644,109 @@ def compute_language_fit_score(title: str, desc: str) -> int:
     return 1 if bool(norm) else 0
 
 
+# Companies with established tech worker sponsorship programs in NL/DE/EU.
+# Use full/distinctive names only — no 2-3 char tokens that cause substring false positives.
+KNOWN_SPONSORING_COMPANIES = [
+    # Big tech
+    "amazon", "amazon web services", "microsoft", "google", "meta",
+    "apple", "netflix", "ibm", "oracle", "salesforce", "cisco",
+    "vmware", "intel", "nvidia", "qualcomm", "ericsson", "nokia",
+    # Financial infrastructure
+    "swift", "mastercard", "visa", "bloomberg",
+    # NL multinationals
+    "asml", "booking.com", "adyen", "philips", "shell", "ing bank",
+    "abn amro", "rabobank", "heineken", "randstad", "wolters kluwer",
+    "nxp semiconductors", "tomtom",
+    # DE multinationals
+    "siemens", "bosch", "deutsche telekom", "zalando", "delivery hero",
+    "allianz", "deutsche bank",
+    # SAP separately to avoid substring noise
+    "sap se",
+    # Large consulting that sponsor in EU
+    "capgemini", "accenture", "atos", "cgi", "sopra steria", "devoteam", "fujitsu",
+    "infosys", "wipro", "tata consultancy", "cognizant", "deloitte",
+    "kpmg", "ernst & young", "pricewaterhousecoopers",
+    # Cloud-native / scale-ups
+    "cloudflare", "datadog", "hashicorp", "gitlab", "github",
+    # Ireland tech (Dublin EU HQ for US giants)
+    "stripe", "hubspot", "workday", "airbnb", "linkedin",
+    # UK tech / finance
+    "barclays", "hsbc", "lloyds", "natwest", "bt group", "bt ",
+    "sky ", "vodafone", "arm ", "sage ",
+    # France ESN/tech (sponsorisent via Passeport Talent)
+    "sopra steria", "thales", "orange", "atos", "dassault",
+    # UAE tech
+    "noon", "property finder", "talabat", "dubizzle",
+]
+
+# Patterns to match company name in the company FIELD only (word boundaries).
+_KNOWN_COMPANY_FIELD_PATTERNS = [re.compile(rf"\b{re.escape(c)}\b", re.I) for c in KNOWN_SPONSORING_COMPANIES]
+
+# Affiliation phrases: detect "Part of Accenture" etc. in description — employer relationship only.
+_AFFILIATION_PREFIX_RE = re.compile(
+    r"\b(?:part\s+of|subsidiary\s+of|owned\s+by|acquired\s+by|a\s+division\s+of|member\s+of)\s+",
+    re.I,
+)
+
+
+def compute_company_sponsor_signal(company: str, desc: str) -> int:
+    """
+    +3 if the COMPANY FIELD matches a known sponsoring employer (word boundary).
+    +3 if description has an affiliation phrase ("Part of Accenture") referencing a known company.
+       Tools mentioned in desc (GitHub, Jenkins) are NOT counted as company signals.
+    +2 if description shows international/global scale signals.
+    Range: [0, +5].
+    """
+    company_norm = normalize_text(company or "").strip()
+    desc_norm = normalize_text(desc or "")
+    score = 0
+
+    # Match company field — exact word-boundary, no tool false positives.
+    if any(pat.search(company_norm) for pat in _KNOWN_COMPANY_FIELD_PATTERNS):
+        score += 3
+
+    # Match affiliation phrases in description only when preceded by "part of" etc.
+    if score == 0:
+        for m in _AFFILIATION_PREFIX_RE.finditer(desc_norm):
+            after = desc_norm[m.end():m.end() + 60]
+            if any(pat.search(after) for pat in _KNOWN_COMPANY_FIELD_PATTERNS):
+                score += 3
+                break
+
+    global_signals = [
+        "presence in", "offices in", "worldwide", "internationally",
+        "global company", "global team", "international team",
+        "multinational", "across countries", "across the globe",
+    ]
+    if any(sig in desc_norm for sig in global_signals):
+        score += 2
+
+    return min(5, score)
+
+
+def compute_sponsorship_score(title: str, desc: str) -> int:
+    """
+    Detect sponsorship / relocation signals in job text.
+    +ve = employer likely sponsors; -ve = explicitly no sponsorship.
+    Range: [-10, +10]. 0 = no signal (most jobs).
+    Negative phrases are checked first — if any match, no positive score is added.
+    """
+    text = normalize_text(f"{title or ''} {desc or ''}")
+    score = 0
+    # Check negatives first — if any hard negative found, cap at -8
+    neg_hit = False
+    for phrase in SPONSORSHIP_NEGATIVE_PHRASES:
+        if normalize_text(phrase) in text:
+            score -= 8
+            neg_hit = True
+    # Only add positive score if no explicit negation was found
+    if not neg_hit:
+        for phrase in SPONSORSHIP_POSITIVE_PHRASES:
+            if normalize_text(phrase) in text:
+                score += 5
+    return max(-10, min(10, score))
+
+
 def compute_priority_score(
     title: str,
     desc: str,
@@ -2033,6 +2755,8 @@ def compute_priority_score(
     junior_score: int,
     language_fit_score: int,
     hiring_likelihood_score: int = 0,
+    sponsorship_score: int = 0,
+    company_sponsor_signal: int = 0,
 ) -> int:
     """
     Rank jobs by apply-first priority.
@@ -2040,10 +2764,18 @@ def compute_priority_score(
     """
     text = normalize((title or "") + " " + (desc or ""))
     loc_norm = normalize(loc or "")
+    it_track, _track_hits = infer_it_track(title, desc)
     score = 50 + max(0, junior_score) * 2 + language_fit_score * 2
     # Blend in a bounded hiring-likelihood component so top rows are both relevant
     # and realistically attainable for junior applications.
     score += max(-4, min(6, int(hiring_likelihood_score)))
+
+    # Sponsorship signal: double weight for NL/DE where it's the primary constraint.
+    sponsor_weight = 2 if ACTIVE_MARKET in {"nl", "de"} else 1
+    score += int(sponsorship_score) * sponsor_weight
+    # Company size/reputation signal (capped to avoid drowning other signals).
+    score += min(5, int(company_sponsor_signal))
+    score += int(IT_TRACK_PRIORITY_BONUS.get(it_track, 0))
 
     for term, weight in ACTIVE_PRIORITY_TERMS.items():
         if normalize(term) in text:
@@ -2237,6 +2969,11 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
 
     if is_internship_student_only(title, desc):
         return None
+    # Morocco queue quality improves materially if we drop generic internship wording
+    # before ranking. These are rarely "apply now" targets for the intended profile,
+    # even when they mention IT support tasks.
+    if ACTIVE_MARKET == "ma" and internship_generic_detail(title, desc):
+        return None
 
     exclude_hard_hits, _exclude_soft_hits = classify_excluded_hits(title, full_text)
     if exclude_hard_hits:
@@ -2251,11 +2988,12 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
     blocked_language_reason = blocked_language_requirement_reason(full_text, filter_mode=mode)
     blocked_language_reason_strict = blocked_language_requirement_reason(full_text, filter_mode="strict")
     language_need = classify_language_need(full_text)
+    language_review_reason = language_manual_review_reason(full_text)
     if blocked_language_reason:
         return None
 
     disallowed_language_detected = is_disallowed_language(full_text)
-    if mode == "strict" and disallowed_language_detected:
+    if mode == "strict" and disallowed_language_detected and language_review_reason != "language_alternative:dutch_preferred_or_learn":
         return None
 
     # Autoriser les offres neutres (score >= 0) pour ne pas filtrer trop agressivement
@@ -2265,6 +3003,7 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
     if junior_score < min_junior_score:
         return None
     language_fit_score = compute_language_fit_score(title, desc)
+    it_track, it_track_hits = infer_it_track(title, desc)
     hiring_likelihood_score, hiring_likelihood_reasons = compute_hiring_likelihood_score(
         title=title,
         desc=desc,
@@ -2272,6 +3011,8 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
         experience_level=experience_level,
         language_need=language_need,
     )
+    sponsorship_score = compute_sponsorship_score(title, desc)
+    company_sponsor_signal = compute_company_sponsor_signal(company, desc)
 
     return {
         "title": title,
@@ -2286,8 +3027,12 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
         "search_term": job.get("search_term", ""),
         "junior_score": junior_score,
         "language_fit_score": language_fit_score,
+        "it_track": it_track,
+        "it_track_signals": " | ".join(it_track_hits),
         "hiring_likelihood_score": hiring_likelihood_score,
         "hiring_likelihood_reasons": " | ".join(hiring_likelihood_reasons),
+        "sponsorship_score": sponsorship_score,
+        "company_sponsor_signal": company_sponsor_signal,
         "priority_score": compute_priority_score(
             title,
             desc,
@@ -2296,13 +3041,15 @@ def passes_filters(job: dict, source: str = "adzuna", filter_mode: str = "") -> 
             junior_score,
             language_fit_score,
             hiring_likelihood_score,
+            sponsorship_score,
+            company_sponsor_signal,
         ),
         "is_remote": work_mode in {"remote", "hybrid"},
         "work_mode": work_mode,
         "years_required": years_required if years_required is not None else "",
         "experience_level": experience_level,
         "experience_detail": normalize_text(experience_detail) if experience_detail else "",
-        "blocked_language_reason": blocked_language_reason_strict,
+        "blocked_language_reason": blocked_language_reason_strict or language_review_reason,
         "language_need_label": (
             "requires_blocked_language"
             if language_need.get("requires_blocked_language")
@@ -2534,6 +3281,9 @@ def main():
         df_raw = pd.read_csv(adzuna_raw_csv)
         all_jobs = df_raw.to_dict(orient="records")
     else:
+        if not ACTIVE_MARKET_PROFILE.get("supports_adzuna", True):
+            raise RuntimeError(f"Adzuna fetch is not supported for market '{ACTIVE_MARKET}'.")
+        require_adzuna_credentials()
         for term in search_terms:
             print(f"[INFO] Searching for: {term}")
             page_count = PAGES_PER_TERM.get(term, DEFAULT_PAGES)

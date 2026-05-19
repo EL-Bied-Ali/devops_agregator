@@ -1,5 +1,5 @@
 """
-Merge Adzuna and Jooble jobs, deduplicate (3 levels), then apply final filters.
+Merge provider outputs, deduplicate (3 levels), then apply final filters.
 """
 
 import re
@@ -21,11 +21,17 @@ from config import (
 )
 
 
+def safe_text(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value)
+
+
 def normalize_simple(text: str) -> str:
     """Lowercase, strip accents, remove punctuation and collapse spaces."""
     if not text:
         return ""
-    text = str(text)
+    text = safe_text(text)
     text = unicodedata.normalize("NFD", text)
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
     text = re.sub(r"[^a-z0-9\s]", " ", text.lower())
@@ -37,7 +43,7 @@ def strip_tokens(text: str) -> str:
     """Remove common tokens that create false duplicates."""
     if not text:
         return ""
-    cleaned = str(text).lower()
+    cleaned = safe_text(text).lower()
     cleaned = re.sub(r"\(m[fwhx]/?f?/?x?\)", " ", cleaned)
     for tok in ["m/f/x", "m/f", "m w d", "junior", "senior", "medior"]:
         cleaned = cleaned.replace(tok, " ")
@@ -51,22 +57,22 @@ def canonical_key(company: str, title: str, location: str) -> str:
 
 
 def parse_date(date_str: str) -> Optional[datetime]:
-    if not date_str:
+    if not safe_text(date_str):
         return None
     try:
-        return datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+        return datetime.fromisoformat(safe_text(date_str).replace("Z", "+00:00"))
     except Exception:
         return None
 
 
 def salary_present(job: Dict) -> bool:
-    return bool(job.get("salary_min")) or bool(job.get("salary_max"))
+    return bool(safe_text(job.get("salary_min"))) or bool(safe_text(job.get("salary_max")))
 
 
 def choose_best(a: Dict, b: Dict) -> Dict:
     """Pick the best job using description length, recency, salary, source preference."""
-    desc_a = len((a.get("description") or "").strip())
-    desc_b = len((b.get("description") or "").strip())
+    desc_a = len(safe_text(a.get("description")).strip())
+    desc_b = len(safe_text(b.get("description")).strip())
     if desc_b > desc_a:
         better = b
     elif desc_a > desc_b:
@@ -95,7 +101,7 @@ def choose_best(a: Dict, b: Dict) -> Dict:
                 better = a
             else:
                 # Source preference
-                prefer_order = ["adzuna", "jooble"]
+                prefer_order = ["adzuna", "emploi_ma", "rekrute", "marocannonces", "jooble"]
                 a_score = prefer_order.index(a.get("source")) if a.get("source") in prefer_order else len(prefer_order)
                 b_score = prefer_order.index(b.get("source")) if b.get("source") in prefer_order else len(prefer_order)
                 if b_score < a_score:
@@ -185,15 +191,15 @@ def map_adzuna_row(row: Dict) -> Dict:
         company = row.get("company.display_name", "")
 
     return {
-        "title": row.get("title", ""),
-        "company": company,
-        "location": row.get("location.display_name", "") or row.get("location", ""),
-        "created": row.get("created", ""),
-        "url": row.get("redirect_url", ""),
+        "title": safe_text(row.get("title", "")),
+        "company": safe_text(company),
+        "location": safe_text(row.get("location.display_name", "") or row.get("location", "")),
+        "created": safe_text(row.get("created", "")),
+        "url": safe_text(row.get("redirect_url", "")),
         "salary_min": row.get("salary_min"),
         "salary_max": row.get("salary_max"),
-        "description": row.get("description", "") or "",
-        "search_term": row.get("search_term", ""),
+        "description": safe_text(row.get("description", "") or ""),
+        "search_term": safe_text(row.get("search_term", "")),
         "source": "adzuna",
     }
 
@@ -201,16 +207,61 @@ def map_adzuna_row(row: Dict) -> Dict:
 def map_jooble_row(row: Dict) -> Dict:
     url = row.get("url") or row.get("link", "")
     return {
-        "title": row.get("title", ""),
-        "company": row.get("company", ""),
-        "location": row.get("location", ""),
-        "created": row.get("created", "") or row.get("updated", ""),
-        "url": url,
+        "title": safe_text(row.get("title", "")),
+        "company": safe_text(row.get("company", "")),
+        "location": safe_text(row.get("location", "")),
+        "created": safe_text(row.get("created", "") or row.get("updated", "")),
+        "url": safe_text(url),
         "salary_min": row.get("salary_min"),
         "salary_max": row.get("salary_max"),
-        "description": row.get("description", "") or row.get("snippet", "") or "",
-        "search_term": row.get("search_term", ""),
+        "description": safe_text(row.get("description", "") or row.get("snippet", "") or ""),
+        "search_term": safe_text(row.get("search_term", "")),
         "source": "jooble",
+    }
+
+
+def map_emploi_ma_row(row: Dict) -> Dict:
+    return {
+        "title": safe_text(row.get("title", "")),
+        "company": safe_text(row.get("company", "")),
+        "location": safe_text(row.get("location", "")),
+        "created": safe_text(row.get("created", "")),
+        "url": safe_text(row.get("url", "")),
+        "salary_min": row.get("salary_min"),
+        "salary_max": row.get("salary_max"),
+        "description": safe_text(row.get("description", "") or ""),
+        "search_term": safe_text(row.get("search_term", "") or "emploi_ma_it_category"),
+        "source": "emploi_ma",
+    }
+
+
+def map_rekrute_row(row: Dict) -> Dict:
+    return {
+        "title": safe_text(row.get("title", "")),
+        "company": safe_text(row.get("company", "")),
+        "location": safe_text(row.get("location", "")),
+        "created": safe_text(row.get("created", "")),
+        "url": safe_text(row.get("url", "")),
+        "salary_min": row.get("salary_min"),
+        "salary_max": row.get("salary_max"),
+        "description": safe_text(row.get("description", "") or ""),
+        "search_term": safe_text(row.get("search_term", "") or "rekrute_it_category"),
+        "source": "rekrute",
+    }
+
+
+def map_marocannonces_row(row: Dict) -> Dict:
+    return {
+        "title": safe_text(row.get("title", "")),
+        "company": safe_text(row.get("company", "")),
+        "location": safe_text(row.get("location", "")),
+        "created": safe_text(row.get("created", "")),
+        "url": safe_text(row.get("url", "")),
+        "salary_min": row.get("salary_min"),
+        "salary_max": row.get("salary_max"),
+        "description": safe_text(row.get("description", "") or ""),
+        "search_term": safe_text(row.get("search_term", "") or "marocannonces_informatique_category"),
+        "source": "marocannonces",
     }
 
 
@@ -242,6 +293,9 @@ def main():
     selected_filter_mode = resolve_filter_mode(args.filter_mode, allow_both=True)
     output_paths = get_output_paths(market)
     adzuna_raw_csv = output_paths["adzuna_raw_csv"]
+    emploi_ma_raw_csv = output_paths["emploi_ma_raw_csv"]
+    rekrute_raw_csv = output_paths["rekrute_raw_csv"]
+    marocannonces_raw_csv = output_paths["marocannonces_raw_csv"]
     jooble_raw_csv = output_paths["jooble_raw_csv"]
     merged_raw_csv = output_paths["merged_raw_csv"]
     merged_filtered_csv = output_paths["merged_filtered_csv"]
@@ -254,13 +308,22 @@ def main():
     )
 
     adzuna_raw = load_raw_jobs(adzuna_raw_csv, "Adzuna")
+    emploi_ma_raw = load_raw_jobs(emploi_ma_raw_csv, "Emploi.ma")
+    rekrute_raw = load_raw_jobs(rekrute_raw_csv, "ReKrute")
+    marocannonces_raw = load_raw_jobs(marocannonces_raw_csv, "MarocAnnonces")
     jooble_raw = load_raw_jobs(jooble_raw_csv, "Jooble")
 
-    if not adzuna_raw and not jooble_raw:
+    if not adzuna_raw and not emploi_ma_raw and not rekrute_raw and not marocannonces_raw and not jooble_raw:
         print("[MERGE] Nothing to merge.")
         return
 
-    normalized = [map_adzuna_row(r) for r in adzuna_raw] + [map_jooble_row(r) for r in jooble_raw]
+    normalized = (
+        [map_adzuna_row(r) for r in adzuna_raw]
+        + [map_emploi_ma_row(r) for r in emploi_ma_raw]
+        + [map_rekrute_row(r) for r in rekrute_raw]
+        + [map_marocannonces_row(r) for r in marocannonces_raw]
+        + [map_jooble_row(r) for r in jooble_raw]
+    )
 
     # Save merged raw (normalized)
     safe_save_csv(pd.DataFrame(normalized), merged_raw_csv)

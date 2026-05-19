@@ -385,11 +385,28 @@ def extract_adzuna_job_id(url: str) -> str:
     return m.group(1) if m else ""
 
 
-def normalize_details_url(url: str) -> str:
+def pick_adzuna_host(*urls: str, fallback_host: str = "www.adzuna.be") -> str:
+    """Pick the first Adzuna host found in provided URLs, else fallback."""
+    for raw in urls:
+        u = str(raw or "").strip()
+        if not u:
+            continue
+        try:
+            parsed = urlparse(u)
+            host = (parsed.netloc or "").strip().lower()
+            if host and "adzuna." in host:
+                return host
+        except Exception:
+            continue
+    return fallback_host
+
+
+def normalize_details_url(url: str, default_host: str = "www.adzuna.be") -> str:
     job_id = extract_adzuna_job_id(url)
     if not job_id:
         return ""
-    return f"https://www.adzuna.ch/details/{job_id}"
+    host = pick_adzuna_host(url, fallback_host=default_host)
+    return f"https://{host}/details/{job_id}"
 
 
 def unique_urls(items: list[str]) -> list[str]:
@@ -404,14 +421,14 @@ def unique_urls(items: list[str]) -> list[str]:
     return out
 
 
-def build_fetch_candidates(url: str, canonical_url: str = "") -> list[str]:
+def build_fetch_candidates(url: str, canonical_url: str = "", default_host: str = "www.adzuna.be") -> list[str]:
     """
     Build URL candidates ordered by probability of success.
     - Prefer stable details URL when we can derive a job id.
     - Keep provided URLs as fallback.
     """
-    details_from_url = normalize_details_url(url)
-    details_from_canonical = normalize_details_url(canonical_url)
+    details_from_url = normalize_details_url(url, default_host=default_host)
+    details_from_canonical = normalize_details_url(canonical_url, default_host=default_host)
     return unique_urls(
         [
             details_from_url,
@@ -430,14 +447,14 @@ def token_set(text: str) -> set[str]:
     return {t for t in toks if t not in stop}
 
 
-def absolutize_adzuna_url(href: str) -> str:
+def absolutize_adzuna_url(href: str, base_host: str = "www.adzuna.be") -> str:
     if not href:
         return ""
     if href.startswith("http://") or href.startswith("https://"):
         return href
     if href.startswith("/"):
-        return "https://www.adzuna.ch" + href
-    return "https://www.adzuna.ch/" + href
+        return f"https://{base_host}" + href
+    return f"https://{base_host}/" + href
 
 
 def find_adzuna_url_via_search(
@@ -446,6 +463,7 @@ def find_adzuna_url_via_search(
     location: str,
     session: requests.Session,
     timeout: int = 12,
+    base_host: str = "www.adzuna.be",
 ) -> str:
     """
     Search Adzuna website and pick the most likely matching details URL.
@@ -473,7 +491,7 @@ def find_adzuna_url_via_search(
     for q in queries[:3]:
         try:
             resp = session.get(
-                "https://www.adzuna.ch/search",
+                f"https://{base_host}/search",
                 params={"what": q},
                 timeout=timeout,
                 headers={
@@ -493,7 +511,7 @@ def find_adzuna_url_via_search(
                     href = str(a.get("href", ""))
                     if "/details/" not in href and "/land/ad/" not in href:
                         continue
-                    url = absolutize_adzuna_url(href)
+                    url = absolutize_adzuna_url(href, base_host=base_host)
                     anchor_text = " ".join(a.stripped_strings)
                     parent_text = " ".join(a.parent.stripped_strings) if a.parent else anchor_text
                     candidates.append((url, anchor_text, parent_text))
@@ -502,7 +520,7 @@ def find_adzuna_url_via_search(
                     href = m.group(1)
                     if "/details/" not in href and "/land/ad/" not in href:
                         continue
-                    url = absolutize_adzuna_url(href)
+                    url = absolutize_adzuna_url(href, base_host=base_host)
                     anchor_text = clean_html_fragment(m.group(2))
                     candidates.append((url, anchor_text, anchor_text))
 
@@ -546,6 +564,45 @@ def save_cache(cache_path: str, data: dict):
     os.replace(tmp, cache_path)
 
 
+def _truthy(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _job_identity(row_data: dict) -> tuple[str, str, str]:
+    """
+    Stable identity for reusing previous enrichment outputs.
+    Prefer canonical URL and fall back to source URL + title/company.
+    """
+    canonical = str(row_data.get("canonical_url", "") or "").strip().lower()
+    url = str(row_data.get("url", "") or "").strip().lower()
+    title = str(row_data.get("title", "") or "").strip().lower()
+    company = str(row_data.get("company", "") or "").strip().lower()
+    main_id = canonical or url
+    return main_id, title, company
+
+
+def load_previous_enrichment_map(output_csv: str) -> dict[tuple[str, str, str], dict]:
+    """
+    Load existing diagnostics output to avoid re-enriching already processed rows.
+    """
+    if not output_csv or not os.path.exists(output_csv):
+        return {}
+    try:
+        prev_df = pd.read_csv(output_csv)
+    except Exception:
+        return {}
+    if prev_df.empty:
+        return {}
+
+    out: dict[tuple[str, str, str], dict] = {}
+    for _, row in prev_df.iterrows():
+        row_data = row.to_dict()
+        key = _job_identity(row_data)
+        if key[0]:
+            out[key] = row_data
+    return out
+
+
 def refresh_viewer_html(input_csv: str, market: str, ch_focus: str, filter_mode: str):
     """
     Rebuild local HTML viewer from the latest CSV so browser refresh shows new data.
@@ -570,6 +627,8 @@ def refresh_viewer_html(input_csv: str, market: str, ch_focus: str, filter_mode:
         ch_focus,
         "--filter-mode",
         filter_mode,
+        "--raw-impact-mode",
+        "skip",
         "--no-open",
     ]
     try:
@@ -659,6 +718,7 @@ def fetch_description_from_candidates(
     timeout: int,
     use_browser: bool,
     browser_timeout: int,
+    search_host: str = "www.adzuna.be",
 ) -> tuple[str, str, str]:
     """
     Try several URL candidates and return:
@@ -690,7 +750,14 @@ def fetch_description_from_candidates(
                     return normalized, candidate, ""
             errors.append(f"{candidate}::browser::{perr or 'browser_failed'}")
 
-    search_url = find_adzuna_url_via_search(title, company, location, session=session, timeout=timeout)
+    search_url = find_adzuna_url_via_search(
+        title,
+        company,
+        location,
+        session=session,
+        timeout=timeout,
+        base_host=search_host,
+    )
     if search_url and search_url not in candidates:
         html, err = fetch_with_retries(search_url, session, max_retries=max_retries, timeout=timeout)
         if html:
@@ -994,6 +1061,17 @@ def blocked_reason_detail_from_reason(reason: str) -> str:
     return text.split(":")[-1].strip()
 
 
+def format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    mins, secs = divmod(total, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours}h{mins:02d}m{secs:02d}s"
+    if mins:
+        return f"{mins}m{secs:02d}s"
+    return f"{secs}s"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Enrich filtered jobs with full descriptions + re-filter.")
     parser.add_argument(
@@ -1061,6 +1139,12 @@ def main():
         action="store_true",
         help="Disable description cache reads/writes.",
     )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=20,
+        help="Print progress every N rows (0 disables periodic progress logs).",
+    )
     args = parser.parse_args()
 
     market = af.configure_market(args.market, args.ch_focus)
@@ -1078,10 +1162,12 @@ def main():
         f"[ENRICH] market={market} ch_focus={af.ACTIVE_MARKET_PROFILE['ch_focus']} "
         f"filter_mode={filter_mode}"
     )
+    default_adzuna_host = f"www.adzuna.{af.ACTIVE_MARKET_PROFILE.get('adzuna_country', 'be')}"
 
     default_cache_path = str(Path(args.output).with_name("description_fetch_cache.json"))
     cache_path = "" if args.no_cache else (args.cache_path or default_cache_path)
     cache = load_cache(cache_path) if cache_path else {}
+    previous_enrichment_map = load_previous_enrichment_map(args.output)
 
     df = pd.read_csv(args.input)
     if df.empty:
@@ -1114,20 +1200,44 @@ def main():
     ok = 0
     fail = 0
     cache_hits = 0
+    reuse_hits = 0
+    total_rows = len(df)
+    started_at = time.time()
+    progress_every = max(0, int(args.progress_every))
 
-    for _, row in df.iterrows():
+    for idx, (_, row) in enumerate(df.iterrows(), start=1):
         row_data = row.to_dict()
         url = row_data.get("url") or row_data.get("canonical_url") or ""
         canonical_url = row_data.get("canonical_url") or ""
         source = str(row_data.get("source", "adzuna") or "adzuna")
         original_desc = af.clean_text(row_data.get("description", "") or "")
-        candidates = build_fetch_candidates(str(url), str(canonical_url))
+        row_adzuna_host = pick_adzuna_host(str(url), str(canonical_url), fallback_host=default_adzuna_host)
+        candidates = build_fetch_candidates(str(url), str(canonical_url), default_host=row_adzuna_host)
 
         scraped = ""
         fetch_error = ""
         fetch_used_url = ""
         fetch_from_cache = False
-        if candidates:
+        reused_previous_enrichment = False
+        previous_row = previous_enrichment_map.get(_job_identity(row_data), {})
+        if previous_row:
+            previous_combined = af.clean_text(previous_row.get("combined_description", "") or "")
+            previous_scraped = af.clean_text(previous_row.get("scraped_description", "") or "")
+            previous_fetched = _truthy(previous_row.get("fetched_full_description", False))
+            if previous_fetched and len(previous_combined.strip()) >= af.MIN_DESCRIPTION_CHARS:
+                scraped = previous_scraped if previous_scraped else previous_combined
+                fetch_used_url = str(
+                    previous_row.get("fetch_used_url")
+                    or previous_row.get("working_url")
+                    or previous_row.get("url")
+                    or ""
+                ).strip()
+                fetch_from_cache = _truthy(previous_row.get("fetch_from_cache", False))
+                reused_previous_enrichment = True
+                reuse_hits += 1
+
+        performed_network_fetch = False
+        if candidates and not reused_previous_enrichment:
             # Cache hit: first candidate with cached non-empty description wins.
             if cache_path:
                 for c in candidates:
@@ -1145,6 +1255,7 @@ def main():
                         break
 
             if not scraped:
+                performed_network_fetch = True
                 scraped, fetch_used_url, fetch_error = fetch_description_from_candidates(
                     candidates=candidates,
                     title=str(row_data.get("title", "")),
@@ -1155,6 +1266,7 @@ def main():
                     timeout=args.timeout,
                     use_browser=args.use_browser,
                     browser_timeout=args.browser_timeout,
+                    search_host=row_adzuna_host,
                 )
                 if scraped:
                     if cache_path and fetch_used_url:
@@ -1166,14 +1278,15 @@ def main():
                     ok += 1
                 else:
                     fail += 1
-            time.sleep(args.sleep)
-        else:
+            if performed_network_fetch:
+                time.sleep(args.sleep)
+        elif not candidates and not reused_previous_enrichment:
             fetch_error = "missing_url"
             fail += 1
 
         combined_desc = scraped if scraped and len(scraped) > len(original_desc) else original_desc
-        details_from_url = normalize_details_url(str(url))
-        details_from_canonical = normalize_details_url(str(canonical_url))
+        details_from_url = normalize_details_url(str(url), default_host=row_adzuna_host)
+        details_from_canonical = normalize_details_url(str(canonical_url), default_host=row_adzuna_host)
         working_url = fetch_used_url or details_from_url or details_from_canonical or str(canonical_url or url or "")
         original_len = len((original_desc or "").strip())
         combined_len = len((combined_desc or "").strip())
@@ -1327,6 +1440,7 @@ def main():
                 "working_url": working_url,
                 "fetch_candidates_count": len(candidates),
                 "fetch_error": fetch_error,
+                "reused_previous_enrichment": bool(reused_previous_enrichment),
                 "preview_only_description": bool(preview_only),
                 "not_found_template_detected": bool(page_not_found_detected),
                 "keep_before_recheck": bool(keep_before),
@@ -1365,9 +1479,6 @@ def main():
             keep_row["source_url"] = str(url or "")
             keep_row["source_canonical_url"] = str(canonical_url or "")
             keep_row["working_url"] = working_url
-            if working_url:
-                keep_row["url"] = working_url
-                keep_row["canonical_url"] = working_url.split("?", 1)[0]
             keep_row["needs_manual_review"] = False
             keep_row["manual_review_reason"] = ""
             keep_row["fail_reason_after_recheck"] = ""
@@ -1384,9 +1495,6 @@ def main():
             review_row["source_url"] = str(url or "")
             review_row["source_canonical_url"] = str(canonical_url or "")
             review_row["working_url"] = working_url
-            if working_url:
-                review_row["url"] = working_url
-                review_row["canonical_url"] = working_url.split("?", 1)[0]
             review_row["manual_review_reason"] = manual_review_reason
             review_row["fail_reason_after_recheck"] = fail_reason
             review_row["blocked_reason_detail"] = blocked_reason_detail_from_reason(manual_review_reason or fail_reason)
@@ -1402,9 +1510,6 @@ def main():
             hard_row["source_url"] = str(url or "")
             hard_row["source_canonical_url"] = str(canonical_url or "")
             hard_row["working_url"] = working_url
-            if working_url:
-                hard_row["url"] = working_url
-                hard_row["canonical_url"] = working_url.split("?", 1)[0]
             hard_row["hard_exclude_reason"] = fail_reason
             hard_row["blocked_reason_detail"] = blocked_reason_detail_from_reason(fail_reason)
             hard_row["seniority_flag"] = seniority_flag
@@ -1413,6 +1518,17 @@ def main():
             hard_row["work_mode"] = work_mode
             hard_row["why"] = why_text
             hard_excluded_rows.append(hard_row)
+
+        if progress_every and (idx == 1 or idx % progress_every == 0 or idx == total_rows):
+            elapsed = time.time() - started_at
+            rate = (idx / elapsed) if elapsed > 0 else 0.0
+            eta = ((total_rows - idx) / rate) if rate > 0 else 0.0
+            print(
+                f"[ENRICH][PROGRESS] {idx}/{total_rows} ({(idx * 100.0 / total_rows):.1f}%) "
+                f"elapsed={format_duration(elapsed)} eta={format_duration(eta)} "
+                f"ok={ok} fail={fail} cache_hits={cache_hits} reused_previous={reuse_hits} "
+                f"apply_ready={len(apply_ready_rows)} manual={len(manual_review_rows)} hard={len(hard_excluded_rows)}"
+            )
 
     out_df = pd.DataFrame(rows)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -1426,7 +1542,7 @@ def main():
         manual_review_after = int(bool_to_int_series(out_df["manual_review_after_recheck"]).sum())
 
     print(f"[ENRICH] Input rows: {len(df)}")
-    print(f"[ENRICH] Fetched OK: {ok}, failed: {fail}, cache_hits: {cache_hits}")
+    print(f"[ENRICH] Fetched OK: {ok}, failed: {fail}, cache_hits: {cache_hits}, reused_previous: {reuse_hits}")
     print(f"[ENRICH] Hard excluded after full-description recheck: {excluded_after}")
     print(f"[ENRICH] Marked manual-review after recheck: {manual_review_after}")
     print(f"[ENRICH] Apply-ready after recheck: {len(apply_ready_rows)}")

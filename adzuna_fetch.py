@@ -75,8 +75,9 @@ DEFAULT_BAD_TITLE_KEYWORDS = [
     "staff engineer",
     "staff platform",
     "staff sre",
-    # "Sr." is abbreviated "Senior"
+    # "Sr." / "Sr " are abbreviated "Senior" (n8n "Sr Cloud Engineer")
     "sr. ",
+    "sr ",
 ]
 BAD_TITLE_KEYWORDS = DEFAULT_BAD_TITLE_KEYWORDS + list(EXTRA_BAD_TITLE_KEYWORDS)
 

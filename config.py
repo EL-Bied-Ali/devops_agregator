@@ -634,6 +634,13 @@ ROLE_FORBIDDEN_KEYWORDS = [
     "health safety",
     "wellbeing graduate",
     "management graduate programme",
+    # Java developer / Java QA (not DevOps)
+    "java automation",
+    "java automation engineer",
+    # Pay-to-train schemes ("job guaranteed" = you pay for training then they place you)
+    "job guaranteed",
+    "launch your cyber security career",
+    "career programme",
 
     # QA fonctionnel, testeur non infra
 

@@ -528,6 +528,30 @@ def main():
     ]
     jobs = jobs.sort_values(by=sort_cols, ascending=[False] * len(sort_cols))
 
+    # Cap per-company listings to avoid recruiter spam (Extia x5, SQUAD x4, etc.)
+    # Normalize company name before grouping: strip legal suffixes so that
+    # "D4L data4life" and "D4L data4life gGmbH" count as the same company.
+    MAX_PER_COMPANY = 3
+    if "company" in jobs.columns:
+        _legal_suffixes = (
+            " gmbh", " ggmbh", " ag", " se", " kg", " ohg", " inc", " corp",
+            " ltd", " llc", " plc", " bv", " nv", " sas", " sa", " spa",
+            " sl", " oy", " ab", " as", " a/s", " limited", " group",
+            " recruitment", " consulting", " conseil", " recrutement",
+            " and consulting", " and cons", " solutions",
+        )
+        def _norm_company(name: str) -> str:
+            n = str(name or "").lower().strip()
+            for suffix in _legal_suffixes:
+                if n.endswith(suffix):
+                    n = n[: -len(suffix)].strip()
+            return n
+
+        company_key = jobs["company"].apply(_norm_company)
+        # cumcount within each normalized company key (jobs already sorted by priority)
+        rank_within_company = company_key.groupby(company_key).cumcount()
+        jobs = jobs[rank_within_company < MAX_PER_COMPANY]
+
     keep_cols = [
         "job_id",
         "recommended_action",

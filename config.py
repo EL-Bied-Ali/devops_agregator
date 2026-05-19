@@ -1682,7 +1682,9 @@ MARKET_PROFILES = {
         "role_required_keywords": ROLE_REQUIRED_KEYWORDS,
         "role_forbidden_keywords": ROLE_FORBIDDEN_KEYWORDS,
         "exclude_keywords": FR_EXCLUDE_KEYWORDS,
-        "extra_bad_title_keywords": [],
+        # "Confirmé" = intermediate/mid-level in French consulting (SSII/ESN)
+        # "Expert(e)" alone in title (not "Junior Expert") = senior consultant
+        "extra_bad_title_keywords": ["confirmé", "confirme", "confirmée"],
     },
     "gb": {
         "adzuna_country": "gb",

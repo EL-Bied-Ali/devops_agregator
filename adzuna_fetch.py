@@ -2328,6 +2328,13 @@ COMMERCIAL_SALES_MARKERS = [
     "pipeline",
     "lead generation",
     "cold call",
+    # French commercial/sales roles
+    "ingenieur commercial",
+    "ingénieur commercial",
+    "responsable commercial",
+    "charge de clientele",
+    "chargé de clientèle",
+    "grands comptes",
 ]
 COMMERCIAL_FALSE_POSITIVE_MARKERS = [
     "commercial sector",

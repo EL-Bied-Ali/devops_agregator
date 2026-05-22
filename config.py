@@ -120,6 +120,21 @@ SEARCH_TERMS = [
     "azure engineer",
     "test automation engineer",
     "qa automation engineer",
+    # Titres métiers en pénurie BE/FR (liste officielle Actiris + arrêté FR 2025)
+    "administrateur systemes",
+    "administrateur systèmes",
+    "administrateur reseau",
+    "administrateur réseau",
+    "gestionnaire exploitation informatique",
+    "technicien exploitation informatique",
+    "ingenieur exploitation informatique",
+    "ingenieur production informatique",
+    "technicien systemes reseaux",
+    "technicien systèmes réseaux",
+    "technicien reseau",
+    "ingenieur systemes reseaux",
+    "gestionnaire reseau",
+    "chargé exploitation informatique",
 ]
 
 # ponderation des termes pour le scoring
@@ -1417,6 +1432,14 @@ FR_SEARCH_TERMS = [
     "alternant devops",
     "technicien systeme",
     "technicien infrastructure",
+    # Titres pénurie officiels FR (arrêté mai 2025)
+    "gestionnaire exploitation informatique",
+    "technicien exploitation informatique",
+    "ingenieur production informatique",
+    "administrateur reseau",
+    "gestionnaire reseau",
+    "ingenieur systemes reseaux",
+    "technicien systemes reseaux",
 ]
 
 # Pour la France: pas de blocage de langue — il parle français

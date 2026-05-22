@@ -15,3 +15,15 @@ config_secrets.py
 data/*.csv
 data/*.json
 data/*.html
+data/*.png
+data/*.jpg
+data/*.jpeg
+
+# CV generated outputs
+Ali_EL_Bied_CV.pdf
+Ali_EL_Bied_CV.html
+*_CV_*.pdf
+*_CV_*.html
+
+# Claude Code session files
+.claude/
